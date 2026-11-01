@@ -136,6 +136,11 @@ async function statusText(store: Store): Promise<string> {
         if (s?.error) line += `\n   ⚠️ ${s.error}`
         lines.push(line)
     }
+    const blocked = await store.getCloudflareBlocked()
+    if (blocked.length) {
+        lines.push(`\n☁️ Bloqués par Cloudflare : ${blocked.map(siteIdOf).join(', ')}`)
+        lines.push('Pour débloquer : ouvre la page d\'accueil de TagFusion, touche l\'icône nuage en haut, attends que le site s\'affiche, puis reviens. Recommence pour chaque site.')
+    }
     lines.push(`\nTotal : ${Object.keys(unified).length} tags fusionnés.`)
     return lines.join('\n')
 }

@@ -33,7 +33,7 @@ const K_SITES = 'tf_sites'
 const K_INFO = 'tf_site_info'
 const K_RAW = 'tf_raw_tags'
 const K_MERGES = 'tf_merges'
-const K_CF = 'tf_cloudflare_target'
+const K_CF = 'tf_cloudflare_blocked'
 
 /**
  * Tout ce que l'extension retient : la liste des sites, ce qu'on sait de chacun,
@@ -49,12 +49,21 @@ export class Store {
 
     // --- Sites ---------------------------------------------------------------
 
+    private sitesCache?: string[]
+
     async getSites(): Promise<string[]> {
         const v = await this.state.retrieve(K_SITES)
-        return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+        this.sitesCache = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+        return this.sitesCache
+    }
+
+    /** Dernière liste connue, pour les appels synchrones */
+    sitesSync(): string[] {
+        return this.sitesCache ?? []
     }
 
     async setSites(bases: string[]): Promise<void> {
+        this.sitesCache = bases
         await this.state.store(K_SITES, bases)
         // On oublie les sites retirés (et leurs tags)
         const keep = new Set(bases.map(siteIdOf))
@@ -216,14 +225,37 @@ export class Store {
     }
 
     // --- Cloudflare ---------------------------------------------------------------
+    // Liste des sites bloqués par Cloudflare (adresses de base), dans l'ordre où ils ont bloqué.
 
-    async setCloudflareTarget(base: string): Promise<void> {
-        await this.state.store(K_CF, base)
+    private cfBlocked?: string[]
+
+    async getCloudflareBlocked(): Promise<string[]> {
+        if (!this.cfBlocked) {
+            const v = await this.state.retrieve(K_CF)
+            this.cfBlocked = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+        }
+        return this.cfBlocked
     }
 
-    async getCloudflareTarget(): Promise<string | undefined> {
-        const v = await this.state.retrieve(K_CF)
-        return typeof v === 'string' ? v : undefined
+    /** Version synchrone (dernier état connu), pour les appels de l'app qui n'attendent pas */
+    cloudflareBlockedSync(): string[] {
+        return this.cfBlocked ?? []
+    }
+
+    async markCloudflareBlocked(base: string): Promise<void> {
+        const list = await this.getCloudflareBlocked()
+        if (list.includes(base)) return
+        list.push(base)
+        await this.state.store(K_CF, list)
+    }
+
+    /** Un site a répondu normalement : il n'est plus bloqué */
+    async markCloudflareOk(host: string): Promise<void> {
+        const list = await this.getCloudflareBlocked()
+        const next = list.filter(b => siteIdOf(b) !== host)
+        if (next.length === list.length) return
+        this.cfBlocked = next
+        await this.state.store(K_CF, next)
     }
 
     // --- Sauvegarde -------------------------------------------------------------

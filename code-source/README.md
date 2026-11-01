@@ -30,7 +30,17 @@ L'extension reconnaît automatiquement le type de chaque site :
 
 Limites du mode universel :
 - les sites qui affichent tout en JavaScript (applications web, comme MangaDex) ne renvoient pas de HTML lisible, donc ça ne marche pas ;
-- les sites protégés par Cloudflare doivent être débloqués une fois avec le bouton **Cloudflare Bypass** dans les réglages de l'extension.
+- les sites protégés par Cloudflare doivent être débloqués (voir plus bas).
+
+## Sites protégés par Cloudflare
+
+1. Ouvre la **page d'accueil de TagFusion** (onglet Découvrir/Parcourir de Paperback).
+2. Touche l'**icône nuage ☁️** en haut. Le site bloqué s'ouvre dans le navigateur de Paperback.
+3. Attends que la vraie page du site s'affiche (coche « Je ne suis pas un robot » si elle apparaît), puis ferme.
+4. S'il y a plusieurs sites bloqués, recommence : le nuage ouvre à chaque fois le site suivant.
+
+La liste des sites encore bloqués s'affiche dans **État des sites**, dans les réglages.
+Le déblocage dure plusieurs jours, puis Cloudflare peut redemander une vérification : il suffit de refaire la même chose.
 
 ## Installation : plug and play, sans GitHub ni build (2 minutes)
 

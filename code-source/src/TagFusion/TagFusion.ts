@@ -4,6 +4,8 @@ import {
     ChapterDetails,
     ContentRating,
     DUISection,
+    HomeSection,
+    HomeSectionType,
     PagedResults,
     PartialSourceManga,
     Request,
@@ -23,11 +25,11 @@ import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
 import {
     decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
-    mapLimit, safeDate, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, titleKey
+    mapLimit, safeDate, safeEncode, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.0.4',
+    version: '1.1.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -38,7 +40,8 @@ export const TagFusionInfo: SourceInfo = {
         { text: 'Multi-sources', type: BadgeColor.BLUE },
         { text: 'Tags fusionnés', type: BadgeColor.GREEN }
     ],
-    intents: SourceIntents.MANGA_CHAPTERS | SourceIntents.SETTINGS_UI | SourceIntents.CLOUDFLARE_BYPASS_REQUIRED
+    // HOMEPAGE_SECTIONS fait apparaître la page d'accueil de l'extension, avec l'icône nuage ☁️ du bypass Cloudflare
+    intents: SourceIntents.MANGA_CHAPTERS | SourceIntents.HOMEPAGE_SECTIONS | SourceIntents.SETTINGS_UI | SourceIntents.CLOUDFLARE_BYPASS_REQUIRED
 }
 
 /** Où on en est sur chaque site pendant un défilement de résultats */
@@ -49,12 +52,24 @@ interface SearchMeta {
 
 const DISCOVERY_BUDGET_MS = 12000
 
-/** Ajoute le Referer attendu par les sites (et leurs serveurs d'images) */
-class RefererInterceptor implements SourceInterceptor {
-    constructor(private readonly referers: Map<string, string>) {}
+/**
+ * Ajoute à chaque requête :
+ *  - le User-Agent du navigateur de Paperback. Indispensable pour Cloudflare : le cookie obtenu
+ *    avec le bypass n'est valable qu'avec CE User-Agent, sinon le site bloque encore.
+ *  - le Referer attendu par les sites (et leurs serveurs d'images).
+ */
+class SiteInterceptor implements SourceInterceptor {
+    constructor(
+        private readonly referers: Map<string, string>,
+        private readonly userAgent: () => Promise<string | undefined>
+    ) {}
 
     async interceptRequest(request: Request): Promise<Request> {
         const headers = request.headers ?? {}
+        if (!headers['user-agent'] && !headers['User-Agent']) {
+            const ua = await this.userAgent()
+            if (ua) headers['user-agent'] = ua
+        }
         if (!headers['referer'] && !headers['Referer']) {
             const origin = (/^https?:\/\/[^/]+/i.exec(request.url) ?? [''])[0]
             headers['referer'] = this.referers.get(hostOf(request.url)) ?? `${origin}/`
@@ -77,12 +92,23 @@ export class TagFusion extends Source {
     private imageReferers = new Map<string, string>()
     private htmlCache = new Map<string, { html: string, at: number }>()
     private detailsCache = new Map<string, Details>()
+    private cachedUserAgent?: string
 
     requestManager = App.createRequestManager({
-        requestsPerSecond: 8,
+        // Pas trop vite : un rythme élevé déclenche lui-même les protections Cloudflare
+        requestsPerSecond: 5,
         requestTimeout: 20000,
-        interceptor: new RefererInterceptor(this.imageReferers)
+        interceptor: new SiteInterceptor(this.imageReferers, () => this.userAgent())
     })
+
+    /** User-Agent du navigateur intégré de Paperback (celui qui résout le défi Cloudflare) */
+    private async userAgent(): Promise<string | undefined> {
+        if (this.cachedUserAgent) return this.cachedUserAgent
+        try {
+            this.cachedUserAgent = await this.requestManager.getDefaultUserAgent()
+        } catch { /* l'app fournira le sien */ }
+        return this.cachedUserAgent
+    }
 
     private readonly fetcher: Fetcher = {
         get: (url, headers) => this.http('GET', url, undefined, headers),
@@ -104,10 +130,15 @@ export class TagFusion extends Source {
         const host = hostOf(url)
         if ((response.status === 403 || response.status === 503) &&
             (/cf-chl|challenge-platform|just a moment|cf_clearance/i.test(html) || /cloudflare/i.test(String(response.headers?.['server'] ?? response.headers?.['Server'] ?? '')))) {
-            await this.store.setCloudflareTarget((/^https?:\/\/[^/]+/i.exec(url) ?? [url])[0])
-            throw new Error(`Cloudflare protège ${host}. Va dans les réglages de TagFusion et touche « Cloudflare Bypass », puis réessaie.`)
+            const blocked = await this.store.getCloudflareBlocked()
+            const base = (await this.store.getSiteInfo())[host]?.base ?? (/^https?:\/\/[^/]+/i.exec(url) ?? [url])[0]
+            await this.store.markCloudflareBlocked(base)
+            const n = blocked.length
+            throw new Error(`Cloudflare bloque ${host}. Ouvre la page d'accueil de TagFusion, touche l'icône nuage ☁️ en haut, attends que le site s'affiche, puis reviens.${n > 1 ? ` ${n} sites sont à débloquer : refais-le pour chacun.` : ''}`)
         }
         if (response.status >= 400) throw new Error(`${host} a répondu ${response.status}`)
+        // Le site répond normalement : s'il était bloqué par Cloudflare, il ne l'est plus
+        await this.store.markCloudflareOk(host)
         if (method === 'GET') {
             this.htmlCache.set(url, { html, at: Date.now() })
             if (this.htmlCache.size > 40) {
@@ -224,9 +255,96 @@ export class TagFusion extends Source {
         })
     }
 
+    /**
+     * Appelée quand on touche l'icône nuage ☁️ : l'app ouvre ce site dans son navigateur,
+     * on résout le défi, et Paperback garde le cookie Cloudflare pour les requêtes suivantes.
+     * On propose le premier site encore bloqué ; il suffit de recommencer pour les suivants.
+     */
     override async getCloudflareBypassRequestAsync(): Promise<Request> {
-        const target = await this.store.getCloudflareTarget() ?? (await this.store.getSites())[0] ?? 'https://paperback.moe'
-        return App.createRequest({ url: `${target}/`, method: 'GET', headers: { referer: `${target}/` } })
+        const blocked = await this.store.getCloudflareBlocked()
+        const target = blocked[0] ?? (await this.store.getSites())[0] ?? 'https://paperback.moe'
+        const ua = await this.userAgent()
+        await this.debug(`bypass Cloudflare demandé pour ${siteIdOf(target)}`)
+        return App.createRequest({
+            url: `${target}/`,
+            method: 'GET',
+            headers: { referer: `${target}/`, ...(ua ? { 'user-agent': ua } : {}) }
+        })
+    }
+
+    /** Ancienne version (synchrone) que certaines versions de l'app appellent encore */
+    override getCloudflareBypassRequest(): Request {
+        const target = this.store.cloudflareBlockedSync()[0] ?? this.store.sitesSync()[0] ?? 'https://paperback.moe'
+        return App.createRequest({
+            url: `${target}/`,
+            method: 'GET',
+            headers: { referer: `${target}/`, ...(this.cachedUserAgent ? { 'user-agent': this.cachedUserAgent } : {}) }
+        })
+    }
+
+    // =========================================================================
+    // Page d'accueil : les dernières sorties de chaque site (et l'accès au nuage ☁️)
+    // =========================================================================
+
+    override async getHomePageSections(sectionCallback: (section: HomeSection) => void): Promise<void> {
+        await this.debug('page d\'accueil : chargement')
+        try {
+            await this.userAgent()
+            await this.store.getCloudflareBlocked()
+            const sites = (await this.store.getSites()).slice(0, 12)
+            await mapLimit(sites, 3, async base => {
+                const siteId = siteIdOf(base)
+                try {
+                    const engine = await this.engineOf(siteId)
+                    const $ = this.fetcher.load(await this.fetcher.get(`${base}/`))
+                    const items = this.toPartials(siteId, engine.parseListing($, `${base}/`, base).slice(0, 24))
+                    // Jamais de section vide
+                    if (items.length === 0) return
+                    const name = (await this.store.site(siteId))?.name || siteId
+                    sectionCallback(App.createHomeSection({
+                        id: 'home_' + safeEncode(siteId),
+                        title: name.slice(0, 60),
+                        type: HomeSectionType.singleRowNormal,
+                        items,
+                        containsMoreItems: false
+                    }))
+                } catch (e) {
+                    await this.store.updateSite(siteId, { error: e instanceof Error ? e.message : String(e) })
+                }
+            })
+            await this.debug(`page d'accueil : terminée (${this.store.cloudflareBlockedSync().length} site(s) bloqué(s) par Cloudflare)`)
+        } catch (e) {
+            await this.debug(`page d'accueil : erreur ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+
+    override async getViewMoreItems(homepageSectionId: string, _metadata: unknown): Promise<PagedResults> {
+        try {
+            const siteId = safeDecode(homepageSectionId.replace(/^home_/, ''))
+            const base = await this.baseOf(siteId)
+            const engine = await this.engineOf(siteId)
+            const $ = this.fetcher.load(await this.fetcher.get(`${base}/`))
+            return App.createPagedResults({ results: this.toPartials(siteId, engine.parseListing($, `${base}/`, base)) })
+        } catch {
+            return App.createPagedResults({ results: [] })
+        }
+    }
+
+    /** Liste du site -> tuiles Paperback, sans doublons et avec des images valides */
+    private toPartials(siteId: string, items: ListingItem[]): PartialSourceManga[] {
+        const out: PartialSourceManga[] = []
+        const ids = new Set<string>()
+        for (const it of items) {
+            const mangaId = encodeMangaId(siteId, it.url)
+            if (ids.has(mangaId)) continue
+            ids.add(mangaId)
+            out.push(App.createPartialSourceManga({
+                mangaId,
+                title: (it.title || 'Sans titre').slice(0, 200),
+                image: safeUrl(it.image)
+            }))
+        }
+        return out
     }
 
     override async supportsTagExclusion(): Promise<boolean> {
