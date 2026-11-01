@@ -30,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.6.0',
+    version: '1.6.1',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -54,6 +54,8 @@ interface SearchMeta {
 }
 
 const DISCOVERY_BUDGET_MS = 10000
+/** Nombre de mangas visé par page de résultats (de quoi remplir l'écran et pouvoir faire défiler) */
+const BATCH_SIZE = 24
 /** Parcours d'un catalogue : fiches lues par site et par tour, et sites parcourus par tour */
 const CRAWL_BATCH = 10
 const CRAWL_SITES_PER_ROUND = 2
@@ -493,10 +495,13 @@ export class TagFusion extends Source {
             await this.debug(`recherche : ${results.length} manga(s) trouvé(s) dans l'index`)
         }
 
-        // On boucle tant qu'on n'a rien à montrer mais qu'il reste des pages quelque part
-        // (un écran vide ferait croire à Paperback que la liste est finie). Limite de temps : 18 s.
+        // On remplit la page avec une vraie fournée (BATCH_SIZE mangas) prise sur tous les sites.
+        // Paperback ne charge la suite que quand on atteint le bas de la liste en faisant défiler :
+        // une page trop courte ne remplit pas l'écran, on ne peut pas défiler, et rien d'autre ne charge.
+        // Limites : quelques tours, et un temps maximum (au-delà, on renvoie ce qu'on a déjà).
         const started = Date.now()
-        for (let round = 0; round < 8 && results.length === 0 && Date.now() - started < 18000; round++) {
+        const wanted = BATCH_SIZE
+        for (let round = 0; round < 12 && results.length < wanted && Date.now() - started < (results.length ? 12000 : 18000); round++) {
             const pending = sites.filter(s => !meta.sites[s]?.done)
             if (pending.length === 0) break
             // Sites avec une page pour le tag : tous à chaque tour (rapide).

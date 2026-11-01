@@ -35,6 +35,13 @@ for (const c of CRAWL_SITES) {
     for (const n of [1, 2, 3, 4]) GET[`https://${c}.test/manga/${c}m${n}/`] = details(`${c} ${n}`, n === 2 ? ['Romance'] : ['Action'])
 }
 
+// --- Grand site : 60 mangas pour le tag, 6 pages de liste de 10 ---
+GET['https://big.test/'] = page('<a href="https://big.test/genre/romance/">Romance</a>' + card('big.test', 'z1', 'Z1') + card('big.test', 'z2', 'Z2') + card('big.test', 'z3', 'Z3') + card('big.test', 'z4', 'Z4'))
+for (let p = 1; p <= 7; p++) {
+    const url = p === 1 ? 'https://big.test/genre/romance/' : `https://big.test/genre/romance/page/${p}/`
+    GET[url] = p <= 6 ? page(Array.from({ length: 10 }, (_, i) => card('big.test', `big${(p - 1) * 10 + i + 1}`, `Big ${(p - 1) * 10 + i + 1}`)).join('')) : page('<p>Fin</p>')
+}
+
 // --- Fiches pour les tests de chapitres ---
 GET['https://legacy.test/'] = page('<p>x</p>')
 GET['https://legacy.test/manga/old_one/'] = details('Old One', ['Action'], 3)
@@ -174,9 +181,10 @@ async function main(): Promise<void> {
     indexWrites = 0
     let r = await src.getSearchResults({ includedTags: [tag], excludedTags: [] }, undefined)
     assert.ok(r.results.length > 0, 'la première page affiche des mangas')
-    assert.ok(requests.length <= 30, `première page trop lourde : ${requests.length} requêtes`)
-    assert.ok(indexWrites <= 3, `trop d'écritures de l'index : ${indexWrites}`)
-    console.log(`✓ 7 sites dont 6 sans page de tag : 1re page en ${requests.length} requêtes, ${indexWrites} écriture(s) de l'index, ${r.results.length} manga(s)`)
+    assert.ok(requests.length <= 60, `première page trop lourde : ${requests.length} requêtes`)
+    assert.equal(r.results.length, 10, 'moins de 24 mangas en tout : la première page les montre tous')
+    assert.ok(indexWrites <= 8, `trop d'écritures de l'index : ${indexWrites} (une par lot de 10 fiches attendue)`)
+    console.log(`✓ 7 sites dont 6 sans page de tag : 1re page pleine (${r.results.length} mangas) en ${requests.length} requêtes, ${indexWrites} écriture(s) de l'index`)
     const all: string[] = r.results.map((m: any) => m.title)
     let meta2 = r.metadata
     let guard = 0
@@ -190,12 +198,30 @@ async function main(): Promise<void> {
     assert.deepEqual([...all].sort(), [...wanted].sort())
     console.log(`✓ En faisant défiler : les ${wanted.length} mangas Romance des 7 sites, sans doublon`)
 
+    // --- Défilement infini sur un grand site : des fournées pleines jusqu'à la fin ---
+    await src.store.setSites(['https://big.test'])
+    await src.discoverAll(true)
+    const batches: number[] = []
+    const bigIds = new Set<string>()
+    let bm: unknown = undefined
+    let bguard = 0
+    do {
+        const br = await src.getSearchResults({ includedTags: [tag], excludedTags: [] }, bm)
+        batches.push(br.results.length)
+        for (const m of br.results) bigIds.add(m.mangaId)
+        bm = br.metadata
+    } while (bm !== undefined && bguard++ < 20)
+    assert.equal(bigIds.size, 60, `les 60 mangas doivent sortir (obtenu ${bigIds.size})`)
+    assert.ok((batches[0] ?? 0) >= 24 && (batches[1] ?? 0) >= 24, `fournées trop petites : ${batches.join(', ')}`)
+    assert.equal(batches.slice(0, -1).filter(n => n === 0).length, 0, 'aucune page vide avant la fin')
+    console.log(`✓ Grand site (60 mangas pour le tag) : fournées de ${batches.join(' + ')} en faisant défiler, tous affichés`)
+
     // --- Réinitialisation partielle : index et tags effacés, sites gardés ---
     assert.ok(await src.store.indexSize() > 0)
     await src.resetExtension(false)
     assert.equal(await src.store.indexSize(), 0)
     assert.equal(Object.keys(await src.store.unified()).length, 0)
-    assert.equal((await src.store.getSites()).length, 7)
+    assert.equal((await src.store.getSites()).length, 1)
     console.log('✓ « Effacer l\'index et les tags » : index vide, tags vides, sites conservés')
 
     // --- Réinitialisation complète ---
