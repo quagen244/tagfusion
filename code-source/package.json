@@ -1,0 +1,23 @@
+{
+  "name": "tagfusion-extensions",
+  "version": "1.0.0",
+  "repositoryName": "TagFusion",
+  "description": "Recherche par tags fusionnés sur plusieurs sites, pour Paperback 0.8",
+  "main": "lib/index.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "bundle": "npx paperback bundle",
+    "serve": "npx paperback serve",
+    "test": "npx tsx tests/utils.test.ts"
+  },
+  "license": "GPL-3.0-or-later",
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^4.9.5"
+  },
+  "dependencies": {
+    "@paperback/toolchain": "0.8.7",
+    "@paperback/types": "0.8.7",
+    "cheerio": "1.0.0-rc.12"
+  }
+}

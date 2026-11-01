@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TagFusion</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f5f2; --fg:#1d1c22; --muted:#6b6875; --card:#fff; --accent:#3b82f6; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16161f; --fg:#ecebf2; --muted:#9a97a6; --card:#21212d; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, system-ui, sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:40px 16px; }
+  img { width:72px; height:72px; border-radius:16px; }
+  h1 { margin:16px 0 4px; font-size:28px; }
+  p { color:var(--muted); }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin-top:20px; }
+  code { display:block; word-break:break-all; font-size:15px; padding:12px; border-radius:10px; background:var(--bg); color:var(--fg); margin:8px 0; }
+  button { font:inherit; border:0; border-radius:10px; padding:10px 16px; background:var(--accent); color:#fff; }
+  ol { padding-left:20px; }
+</style>
+</head>
+<body>
+<main>
+  <img src="TagFusion/includes/icon.png" alt="">
+  <h1>TagFusion est en ligne ✅</h1>
+  <p>Recherche par tags fusionnés sur plusieurs sites, pour Paperback 0.8.</p>
+  <div class="card">
+    <strong>Adresse à coller dans Paperback :</strong>
+    <code id="url"></code>
+    <button id="copy">Copier</button>
+  </div>
+  <div class="card">
+    <ol>
+      <li>Paperback → Réglages → Sources externes → <b>+</b> → colle l'adresse.</li>
+      <li>Installe <b>TagFusion</b>.</li>
+      <li>Dans les réglages de TagFusion : <b>Mes sites</b> → colle tes sites, puis <b>Charger / mettre à jour les tags</b>.</li>
+    </ol>
+  </div>
+</main>
+<script>
+  const url = location.href.replace(/index\.html.*$/, '').replace(/[?#].*$/, '').replace(/\/$/, '');
+  document.getElementById('url').textContent = url;
+  document.getElementById('copy').onclick = async () => {
+    try { await navigator.clipboard.writeText(url); document.getElementById('copy').textContent = 'Copié !'; } catch (e) {}
+  };
+</script>
+</body>
+</html>
