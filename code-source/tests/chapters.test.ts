@@ -46,7 +46,7 @@ GET['https://next.test/manga/nova/'] = page('<div id="__next"></div>', `<script 
 
 // 8. Volumes et titres de chapitres
 GET['https://vol.test/'] = page(generic)
-GET['https://vol.test/manga/saga/'] = page('<h1>Saga</h1><ul class="chapters"><li><a href="/manga/saga/v2c15">Vol.2 Ch.15 : Retour</a></li><li><a href="/manga/saga/v2c14">Vol.2 Ch.14 : Départ</a></li></ul>')
+GET['https://vol.test/manga/saga/'] = page('<h1>Saga</h1><ul class="chapters"><li><a href="/manga/saga/v2c15">Vol.2 Ch.15 : Retour</a></li><li><a href="/manga/saga/v2c14">Vol.2 Ch.14 : Départ</a></li></ul>').replace('<html>', '<html lang="fr-FR">')
 
 // 9. Chapitres sans numéro (prologue, épilogue)
 GET['https://nonum.test/'] = page(generic)
@@ -138,6 +138,9 @@ async function main(): Promise<void> {
         assert.ok(chs.every(c => /^[A-Za-z0-9._-]+$/.test(c.id)), 'identifiants sans caractères spéciaux')
         assert.ok(chs.every(c => c.time instanceof Date && !isNaN(c.time.getTime())), 'dates valides')
         assert.ok(chs.every(c => Number.isFinite(c.chapNum)), 'numéros valides')
+        assert.ok(chs.every(c => typeof c.langCode === 'string' && c.langCode.length >= 2), 'langue renseignée')
+        assert.ok(chs.every(c => typeof c.name === 'string' && c.name.length > 0), 'nom toujours rempli')
+        assert.ok(chs.every(c => c.volume === undefined || c.volume > 0), 'pas de volume 0')
     }
 
     let c = await chaptersOf('madara-ajax.test', '/manga/hero/'); check(c)
@@ -164,10 +167,11 @@ async function main(): Promise<void> {
     assert.deepEqual(nums(c), [3, 2, 1]); assert.equal(c[2].time.getMonth(), 0); console.log('✓ 7. Site moderne (données cachées __NEXT_DATA__) : 3 chapitres datés')
 
     c = await chaptersOf('vol.test', '/manga/saga/'); check(c)
-    assert.deepEqual(c.map(x => [x.volume, x.chapNum, x.name]), [[2, 15, 'Retour'], [2, 14, 'Départ']]); console.log('✓ 8. Volumes et titres : « Vol. 2 Ch. 15 Retour »')
+    assert.deepEqual(c.map(x => [x.volume, x.chapNum, x.name]), [[2, 15, 'Retour'], [2, 14, 'Départ']])
+    assert.equal(c[0].langCode, 'fr'); console.log('✓ 8. Volumes, titres et langue du site : « Vol. 2 Ch. 15 Retour », langue fr')
 
     c = await chaptersOf('nonum.test', '/manga/myth/'); check(c)
-    assert.equal(c.length, 3); assert.deepEqual(c.map(x => x.name), ['Épilogue', '', 'Prologue'])
+    assert.equal(c.length, 3); assert.deepEqual(c.map(x => x.name), ['Épilogue', 'Chapter 1', 'Prologue'])
     assert.deepEqual(nums(c), [1.5, 1, 0]); console.log('✓ 9. Chapitres sans numéro : Épilogue après le 1, Prologue = 0')
 
     c = await chaptersOf('madara.test', '/manga/solo/'); check(c)

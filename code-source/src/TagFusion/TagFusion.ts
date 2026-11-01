@@ -30,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.4.0',
+    version: '1.4.1',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -641,10 +641,12 @@ export class TagFusion extends Source {
         const url = base + path
         const engine = await this.engineOf(siteId)
         let chapters: Awaited<ReturnType<Engine['getChapters']>> = []
+        let langCode = 'en'
         try {
             const $ = this.fetcher.load(await this.fetcher.get(url))
+            langCode = languageOf($('html').attr('lang'))
             chapters = await engine.getChapters(this.fetcher, url, $, base)
-            await this.debug(`chapitres ${siteId} (${engine.name}) : ${chapters.length} trouvé(s) sur ${path.slice(0, 60)}`)
+            await this.debug(`chapitres ${siteId} (${engine.name}, langue ${langCode}) : ${chapters.length} trouvé(s) sur ${path.slice(0, 60)}`)
         } catch (e) {
             await this.debug(`chapitres ${siteId} (${engine.name}) : erreur ${e instanceof Error ? e.message : String(e)}`)
             throw e
@@ -661,13 +663,16 @@ export class TagFusion extends Source {
             seenIds.add(id)
             const info = infos[i] ?? { num: -1, volume: 0, name: '' }
             const num = nums[i] ?? 0
+            const volume = safeNumber(c.volume || info.volume)
+            // Mêmes champs que les extensions Paperback 0.8 qui fonctionnent : une langue (Paperback
+            // filtre les chapitres par langue), un nom toujours rempli, un volume seulement s'il existe
             out.push(App.createChapter({
                 id,
                 chapNum: safeNumber(num),
-                volume: safeNumber(c.volume || info.volume),
-                name: info.name.slice(0, 120),
+                name: (info.name || `Chapter ${safeNumber(num)}`).slice(0, 120),
+                langCode,
                 time: safeDate(c.date),
-                sortingIndex: -i
+                ...(volume > 0 ? { volume } : {})
             }))
         })
         return out
@@ -704,6 +709,12 @@ export class TagFusion extends Source {
             return 'https://paperback.moe'
         }
     }
+}
+
+/** Langue d'une page ("fr-FR" -> "fr"), "en" par défaut, au format attendu par Paperback */
+export function languageOf(lang: string | undefined): string {
+    const m = /^([a-z]{2,3})(?:[-_]|$)/i.exec((lang ?? '').trim())
+    return m?.[1] ? m[1].toLowerCase() : 'en'
 }
 
 /**
