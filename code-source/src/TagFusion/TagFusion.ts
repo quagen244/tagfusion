@@ -30,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.5.0',
+    version: '1.5.1',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -51,7 +51,9 @@ interface SearchMeta {
     seen: string[]
 }
 
-const DISCOVERY_BUDGET_MS = 12000
+const DISCOVERY_BUDGET_MS = 10000
+/** Durée maximum d'une action lancée depuis les réglages */
+const SETTINGS_BUDGET_MS = 25000
 
 /**
  * Ajoute à chaque requête :
@@ -139,9 +141,9 @@ export class TagFusion extends Source {
         if (response.status >= 400) throw new Error(`${host} a répondu ${response.status}`)
         // Le site répond normalement : s'il était bloqué par Cloudflare, il ne l'est plus
         await this.store.markCloudflareOk(host)
-        if (method === 'GET') {
+        if (method === 'GET' && html.length < 1500000) {
             this.htmlCache.set(url, { html, at: Date.now() })
-            if (this.htmlCache.size > 40) {
+            if (this.htmlCache.size > 15) {
                 const oldest = this.htmlCache.keys().next().value
                 if (oldest !== undefined) this.htmlCache.delete(oldest)
             }
@@ -264,8 +266,9 @@ export class TagFusion extends Source {
 
     override async getSourceMenu(): Promise<DUISection> {
         return buildSettings(this.store, {
-            discoverAll: force => this.discoverAll(force),
-            importRepos: async () => { await this.importRepos(); await this.discoverAll(false) },
+            // Actions des réglages : attendues jusqu'au bout, mais bornées dans le temps
+            discoverAll: force => this.discoverAll(force, Date.now() + SETTINGS_BUDGET_MS),
+            importRepos: async () => { const end = Date.now() + SETTINGS_BUDGET_MS; await this.importRepos(); await this.discoverAll(false, end) },
             diagnose: url => this.diagnoseManga(url),
             reset: full => this.resetExtension(full)
         })
@@ -370,9 +373,11 @@ export class TagFusion extends Source {
     override async getSearchTags(): Promise<TagSection[]> {
         await this.debug('écran de recherche : demande des tags')
         try {
-            // Les dépôts d'extensions renseignés apportent leurs sites automatiquement
+            // Aucun travail en arrière-plan : tout se termine avant de répondre à l'app.
+            // (Une tâche qui continue après la réponse utilise des objets que l'app a pu libérer,
+            // d'où l'erreur « JSManagedValue was released ».)
+            // Les dépôts renseignés apportent leurs sites automatiquement (une fois par jour au plus)
             if ((await this.store.getSites()).length === 0) await this.importReposIfDue()
-            else this.importReposIfDue().catch(() => undefined)
             const sites = await this.store.getSites()
             // Jamais de liste vide ni de section vide : Paperback 0.8 les supporte mal
             if (sites.length === 0) {
@@ -383,11 +388,8 @@ export class TagFusion extends Source {
                 })]
             }
 
-            // Si on ne connaît encore aucun tag, on attend la découverte (avec une limite de temps).
-            // Sinon, on complète en arrière-plan pour ne pas bloquer l'écran de recherche.
-            const known = Object.keys(await this.store.unified()).length
-            if (known === 0) await this.discoverAll(false, Date.now() + DISCOVERY_BUDGET_MS)
-            else this.discoverAll(false, Date.now() + DISCOVERY_BUDGET_MS).catch(() => undefined)
+            // Sites jamais analysés : découverte de leurs tags, attendue, avec une limite de temps
+            await this.discoverAll(false, Date.now() + DISCOVERY_BUDGET_MS)
 
             const unified = Object.values(await this.store.unified())
                 .sort((a, b) => a.label.localeCompare(b.label))
@@ -486,9 +488,9 @@ export class TagFusion extends Source {
         }
 
         // On boucle tant qu'on n'a rien à montrer mais qu'il reste des pages quelque part
-        // (un écran vide ferait croire à Paperback que la liste est finie). Limite de temps : 25 s.
+        // (un écran vide ferait croire à Paperback que la liste est finie). Limite de temps : 18 s.
         const started = Date.now()
-        for (let round = 0; round < 8 && results.length === 0 && Date.now() - started < 25000; round++) {
+        for (let round = 0; round < 8 && results.length === 0 && Date.now() - started < 18000; round++) {
             const active = sites.filter(s => !meta.sites[s]?.done)
             if (active.length === 0) break
             const perSite = await Promise.all(active.map(s => this.searchSitePage(s, meta, unified, included, excluded, title)))

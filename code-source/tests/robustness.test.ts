@@ -51,7 +51,10 @@ const requests: string[] = []
     createRequest: (i: any) => ({ headers: {}, cookies: [], ...i }),
     createChapter: (i: any) => i, createChapterDetails: (i: any) => i, createTag: (i: any) => i, createTagSection: (i: any) => i,
     createPagedResults: (i: any) => ({ results: [], ...i }), createPartialSourceManga: (i: any) => i,
-    createSourceManga: (i: any) => i, createMangaInfo: (i: any) => i
+    createSourceManga: (i: any) => i, createMangaInfo: (i: any) => i, createHomeSection: (i: any) => i,
+    createDUISection: (i: any) => i, createDUINavigationButton: (i: any) => i, createDUIForm: (i: any) => i,
+    createDUIInputField: (i: any) => i, createDUIBinding: (i: any) => i, createDUIButton: (i: any) => i,
+    createDUIMultilineLabel: (i: any) => i
 }
 
 async function main(): Promise<void> {
@@ -137,6 +140,22 @@ async function main(): Promise<void> {
     assert.ok(!requests.some(u => /beta\.test\/manga\/b\d\/$/.test(u)), 'aucune fiche relue')
     assert.ok(requests.length < firstRunRequests, `moins de requêtes (${requests.length} contre ${firstRunRequests})`)
     console.log(`✓ Deuxième recherche : même résultat, ${requests.length} requêtes au lieu de ${firstRunRequests} (fiches déjà indexées)`)
+
+    // --- Aucune tâche ne continue après la réponse à l'app (cause de « JSManagedValue was released ») ---
+    const quiet = async (label: string, fn: () => Promise<unknown>): Promise<void> => {
+        await fn()
+        const after = requests.length
+        await new Promise(r => setTimeout(r, 300))
+        assert.equal(requests.length, after, `${label} : des requêtes partent encore après la réponse`)
+    }
+    await src.store.updateSite('beta.test', { discoveredAt: undefined })
+    await quiet('écran de recherche', () => src.getSearchTags())
+    await quiet('recherche', () => src.getSearchResults({ includedTags: [tag], excludedTags: [] }, undefined))
+    await quiet('fiche', () => src.getMangaDetails(encodeMangaId('beta.test', 'https://beta.test/manga/b1/')))
+    await quiet('chapitres', () => src.getChapters(encodeMangaId('beta.test', 'https://beta.test/manga/b1/')))
+    await quiet('page d\'accueil', () => src.getHomePageSections(() => undefined))
+    await quiet('bouton Charger les tags', async () => { const menu = await src.getSourceMenu(); const rows = await menu.rows(); await rows.find((r: any) => r.id === 'discover').onTap() })
+    console.log('✓ Aucune requête après la réponse à l\'app (recherche, fiche, chapitres, accueil, réglages)')
 
     // --- Réinitialisation partielle : index et tags effacés, sites gardés ---
     assert.ok(await src.store.indexSize() > 0)
