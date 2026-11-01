@@ -20,7 +20,7 @@ import {
     TagSection
 } from '@paperback/types'
 import { CheerioAPI } from 'cheerio'
-import { parseChapterInfo } from './Chapters'
+import { parseChapterInfo, universalPagesDeep } from './Chapters'
 import { Details, detectEngine, Engine, engineByName, Fetcher, ListingItem } from './Engines'
 import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
@@ -30,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.3.0',
+    version: '1.4.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -681,7 +681,11 @@ export class TagFusion extends Source {
         let pages: string[] = []
         try {
             const html = await this.fetcher.get(pageUrl)
-            pages = engine.parsePages(this.fetcher.load(html), html, pageUrl).map(p => safeUrl(p, '')).filter(Boolean)
+            const $p = this.fetcher.load(html)
+            let found = engine.parsePages($p, html, pageUrl)
+            // Vieux lecteurs "une image par page" : on suit les pages du chapitre
+            if (found.length < 2) found = await universalPagesDeep(this.fetcher, $p, html, pageUrl)
+            pages = [...new Set(found.map(p => safeUrl(p, '')).filter(Boolean))]
             await this.debug(`pages ${siteId} (${engine.name}) : ${pages.length} image(s)${pages[0] ? `, ex. ${pages[0].slice(0, 70)}` : ''}`)
         } catch (e) {
             await this.debug(`pages ${siteId} (${engine.name}) : erreur ${e instanceof Error ? e.message : String(e)}`)
