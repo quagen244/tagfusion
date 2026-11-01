@@ -356,12 +356,14 @@ export function titleKey(title: string): string {
 
 const TAG_PATH_RE = /\/(manga-genres?|manga-tags?|genres?|tags?|categor(?:y|ies)|themes?|tag-manga|genero|generos|kategori|genre-manga)\/([^/?#]+)\/?/i
 const TAG_QUERY_RE = /[?&](genres?|tags?|category|cat|genre\[\])=([^&#]+)/i
+/** Tag sous forme de lien de recherche : "/search?p=1&q=ahegao", "/?q=tag:%22x%22", "/search/?s=x" */
+const TAG_SEARCH_RE = /^\/(?:search|browse|find|recherche)?\/?\?(?:[^#]*&)?(?:q|s|query|keyword|k|search|tag)=([^&#]{1,80})/i
 
 /** Est-ce qu'un lien ressemble à une page "tous les mangas du tag X" ? */
 export function looksLikeTagUrl(url: string): boolean {
     const path = pathOf(url)
     if (/\/(page)\/\d+/i.test(path) && !TAG_PATH_RE.test(path)) return false
-    return TAG_PATH_RE.test(path) || TAG_QUERY_RE.test(path)
+    return TAG_PATH_RE.test(path) || TAG_QUERY_RE.test(path) || TAG_SEARCH_RE.test(path)
 }
 
 // "/c12", "/ch-3", "/ep4" seulement s'ils sont suivis d'une fin de segment : "/manga/c1m1/" reste un manga

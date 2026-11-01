@@ -503,7 +503,8 @@ export function findNextPageUrl($: CheerioAPI, pageUrl: string, page: number): s
         if (found) return
         const cls = el.attribs['class'] ?? ''
         const text = clean($(el).text()).toLowerCase()
-        if (/(^|[\s_-])next([\s_-]|$)|nextpostslink/i.test(cls) || /^(next|next page|suivant|suivante|page suivante|siguiente|weiter|›|»|>|→|>>)$/.test(text)) found = usable($(el).attr('href'))
+        if (/(^|[\s_-])next([\s_-]|$)|nextpostslink/i.test(cls)
+            || /^(?:[‹«<←]\s*)?(next|next page|suivant|suivante|page suivante|siguiente|weiter)(?:\s*[›»>→]+)?$|^[›»>→]{1,2}$/.test(text)) found = usable($(el).attr('href'))
     })
     if (found) return found
     // Lien "N+1" n'importe où, s'il pointe vers la même liste
@@ -524,7 +525,9 @@ export function pageCandidates(url: string, n: number): string[] {
     const query = q >= 0 ? u.slice(q) : ''
     const withQuery = /[?&]page=\d+/.test(u) ? u.replace(/([?&]page=)\d+/, `$1${n}`) : `${u}${q >= 0 ? '&' : '?'}page=${n}`
     const slashN = path.replace(/\/(page\/)?\d+\/?$/, '').replace(/\/?$/, `/${n}/`) + query
-    return [...new Set([pagedUrl(u, n), withQuery, slashN])]
+    // Paramètre "p=1" déjà présent (ex. /search?p=1&q=x) : on le fait avancer
+    const withP = /[?&]p=\d+/.test(u) ? [u.replace(/([?&]p=)\d+/, `$1${n}`)] : []
+    return [...new Set([...withP, pagedUrl(u, n), withQuery, slashN])]
 }
 
 export const ENGINES: Engine[] = [MadaraEngine, ThemesiaEngine, GenericEngine]

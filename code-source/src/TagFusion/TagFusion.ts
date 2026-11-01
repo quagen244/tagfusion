@@ -30,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.6.2',
+    version: '1.7.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -177,7 +177,11 @@ export class TagFusion extends Source {
         const engine = detectEngine(html)
         const $ = this.fetcher.load(html)
         // Nom du site : og:site_name, sinon le titre coupé seulement sur " - ", " | ", " – " (pas "E-Hentai" -> "E")
-        const name = ($('meta[property="og:site_name"]').attr('content') ?? $('title').first().text().split(/\s+[-|–—:]\s+/)[0] ?? siteId).trim() || siteId
+        // (et pour "Index :: HentaiNexus", on garde le morceau qui ressemble au nom de domaine)
+        const parts = $('title').first().text().split(/\s+(?:[-|–—]|::?)\s+/).map(x => x.trim()).filter(Boolean)
+        const domainWord = (siteId.split('.')[0] ?? '').toLowerCase()
+        const fromTitle = parts.find(x => x.toLowerCase().replace(/[^a-z0-9]/g, '').includes(domainWord)) ?? parts[0]
+        const name = ($('meta[property="og:site_name"]').attr('content') ?? fromTitle ?? siteId).trim() || siteId
         await this.store.updateSite(siteId, { base, engine: engine.name, name })
         return engine
     }
@@ -877,7 +881,7 @@ export class TagFusion extends Source {
             const html = await this.fetcher.get(pageUrl)
             const $p = this.fetcher.load(html)
             // Galerie (miniatures vers des pages de lecture) : images en taille réelle, jamais les miniatures
-            let found = await galleryPages(this.fetcher, $p, pageUrl)
+            let found = await galleryPages(this.fetcher, $p, pageUrl, html)
             if (found.length < 2) found = engine.parsePages($p, html, pageUrl)
             // Vieux lecteurs "une image par page" : on suit les pages du chapitre
             if (found.length < 2) found = await universalPagesDeep(this.fetcher, $p, html, pageUrl)

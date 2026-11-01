@@ -457,28 +457,58 @@ export async function universalChapters(f: Fetcher, mangaUrl: string, $: Cheerio
 }
 
 /**
- * Miniatures d'une galerie : liens avec une image vers des pages de lecture numérotées
- * sous l'adresse de la galerie ("/g/123/1/", "/g/123/2/"…), triées par numéro.
+ * Miniatures d'une galerie : liens vers des pages de lecture numérotées, triés par numéro.
+ * Reconnus si la page de lecture est sous l'adresse de la galerie ("/g/123/" -> "/g/123/4/")
+ * ou porte le même identifiant ("/g/694069/" -> "/gallery/694069/4/"). Numérotation à 0 ou 1.
  */
 export function galleryLinks($: CheerioAPI, pageUrl: string, galleryUrl: string): { n: number, url: string, thumb: string }[] {
     const gp = pathOf(galleryUrl).replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase()
     if (gp.length < 2) return []
+    const ids = gp.match(/\d{3,}/g) ?? []
+    const gid = ids[ids.length - 1]
     const out: { n: number, url: string, thumb: string }[] = []
     const seen = new Set<number>()
     $('a[href]').each((_, el) => {
         const img = $(el).find('img').first()
-        if (img.length === 0) return
+        const text = clean($(el).text())
+        // Une miniature (image) ou un simple numéro de page ; pas un lien avec un vrai texte
+        if (img.length === 0 && text !== '' && !/^\d+$/.test(text)) return
         const url = absoluteUrl($(el).attr('href'), pageUrl)
         if (!url || hostOf(url) !== hostOf(galleryUrl)) return
-        const m = /^(.*)\/(\d+)\/?$/.exec(pathOf(url).replace(/[?#].*$/, '').toLowerCase())
-        if (!m || m[1] !== gp) return
+        const path = pathOf(url).replace(/[?#].*$/, '').toLowerCase()
+        if (path.replace(/\/$/, '') === gp) return
+        const m = /^(.*)\/(\d+)\/?$/.exec(path)
+        if (!m) return
+        const parent = m[1] as string
+        const sameGallery = parent === gp || (!!gid && parent.split('/').includes(gid))
+        if (!sameGallery) return
         const n = Number(m[2])
         if (seen.has(n)) return
         seen.add(n)
         const node = img.get(0) as Element | undefined
-        out.push({ n, url: url.replace(/#.*$/, ''), thumb: absoluteUrl(pickImageSrc(node?.attribs ?? {}), pageUrl) ?? '' })
+        out.push({ n, url: url.replace(/#.*$/, ''), thumb: node ? absoluteUrl(pickImageSrc(node.attribs), pageUrl) ?? '' : '' })
     })
     return out.sort((a, b) => a.n - b.n)
+}
+
+/**
+ * Nombre total de pages annoncé par une galerie ("Pages: 35", "46 pages • 24 showing", champ caché).
+ * On garde le plus petit total au moins égal au nombre de miniatures affichées (et au plus 30 fois ce nombre),
+ * pour ne pas confondre avec un autre nombre de la page (« 2303 pages » d'une pagination, etc.).
+ */
+export function totalPagesOf($: CheerioAPI, html: string, shown = 1): number {
+    const found: number[] = []
+    $('input[id*="pages"], input[name*="pages"], input[id*="Pages"]').each((_, el) => {
+        const v = Number(el.attribs['value'])
+        if (Number.isInteger(v) && v > 0 && v < 3000) found.push(v)
+    })
+    const text = html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' ')
+    for (const m of text.matchAll(/\b(\d{1,4})\s*pages?\b|\bpages?\s*:?\s*(\d{1,4})\b/gi)) {
+        const v = Number(m[1] ?? m[2])
+        if (v > 0 && v < 3000) found.push(v)
+    }
+    const plausible = found.filter(v => v >= shown && v <= Math.max(shown * 30, shown + 30))
+    return plausible.length ? Math.min(...plausible) : 0
 }
 
 /** Nombre d'images de lecture affichées directement sur une page (dans une zone de lecteur, hors liens) */
@@ -676,37 +706,84 @@ export function universalPages($: CheerioAPI, html: string, url: string): string
  * la grande image. On essaie de déduire l'adresse des grandes images depuis les miniatures
  * (règle vérifiée sur la première, une du milieu et la dernière) ; sinon on ouvre chaque page.
  */
-export async function galleryPages(f: Fetcher, $: CheerioAPI, url: string): Promise<string[]> {
+export async function galleryPages(f: Fetcher, $: CheerioAPI, url: string, html = ''): Promise<string[]> {
     const thumbs = galleryLinks($, url, url)
     if (thumbs.length < 2) return []
     const fullOf = async (pageUrl: string): Promise<string | undefined> => {
         const h = await f.get(pageUrl)
         return universalPages(f.load(h), h, pageUrl)[0]
     }
+    // Pages annoncées mais dont la miniature n'est pas affichée ("46 pages • 24 showing")
+    const total = totalPagesOf($, html, thumbs.length)
+    const first = thumbs[0] as { n: number, url: string, thumb: string }
+    const contiguous = thumbs.every((t, i) => t.n === first.n + i)
+    const missing = contiguous && total > thumbs.length ? total - thumbs.length : 0
+    const allNumbers = Array.from({ length: thumbs.length + missing }, (_, i) => first.n + i)
+
     const samples = [...new Set([0, Math.floor(thumbs.length / 2), thumbs.length - 1])]
     const sampleFull: (string | undefined)[] = []
     for (const i of samples) {
         try { sampleFull.push(await fullOf((thumbs[i] as { url: string }).url)) } catch { sampleFull.push(undefined) }
     }
     const rule = thumbToFullRule(samples.map(i => (thumbs[i] as { thumb: string }).thumb), sampleFull)
-    if (rule) return thumbs.map(t => rule(t.thumb))
-    // Pas de règle sûre : on ouvre chaque page de lecture
-    const pages = await mapLimitSimple(thumbs, 4, async t => { try { return await fullOf(t.url) } catch { return undefined } })
+    if (rule) {
+        const known = thumbs.map(t => rule(t.thumb))
+        if (!missing) return known
+        // Modèle d'adresse "…/image{n}.jpg" vérifié sur deux pages, pour compléter les pages non affichées
+        const tpl = numberTemplate(known[0] as string, first.n, known[1] as string, first.n + 1)
+        return tpl ? allNumbers.map(tpl) : known
+    }
+    // Pas de règle sûre : on ouvre chaque page de lecture (y compris les pages non affichées)
+    let pageUrls = thumbs.map(t => t.url)
+    if (missing) {
+        const tpl = numberTemplate(first.url, first.n, (thumbs[1] as { url: string }).url, first.n + 1)
+        if (tpl) pageUrls = allNumbers.map(tpl)
+    }
+    const pages = await mapLimitSimple(pageUrls.slice(0, 500), 4, async u => { try { return await fullOf(u) } catch { return undefined } })
     return pages.filter((x): x is string => !!x)
 }
 
-/** Règles connues miniature -> grande image ; retenue seulement si elle reproduit tous les exemples */
+/**
+ * Modèle d'adresse où seul le numéro de page change : à partir de deux exemples (page a et page b),
+ * retourne n -> adresse, ou null si les deux exemples ne suivent pas le même modèle.
+ */
+export function numberTemplate(exA: string, a: number, exB: string, b: number): ((n: number) => string) | null {
+    const m = /^(.*?)(\d+)(\D*)$/.exec(exA.replace(/[?#].*$/, ''))
+    if (!m) return null
+    const before = m[1] as string
+    const after = m[3] as string
+    const digits = m[2] as string
+    // Décalage possible entre le numéro de page et celui du fichier (page 0 -> image1)
+    const offset = Number(digits) - a
+    const pad = digits.startsWith('0') && digits.length > 1
+    const make = (n: number): string => before + (pad ? String(n + offset).padStart(digits.length, '0') : String(n + offset)) + after
+    return make(a) === exA.replace(/[?#].*$/, '') && make(b) === exB.replace(/[?#].*$/, '') ? make : null
+}
+
+/** Règles miniature -> grande image, combinables ; retenue seulement si elle reproduit tous les exemples */
 function thumbToFullRule(thumbs: string[], fulls: (string | undefined)[]): ((t: string) => string) | null {
-    const rules: ((t: string) => string)[] = [
-        t => t.replace(/\/\/t(\d*)\./, '//i$1.').replace(/(\d+)t(\.[a-z]+)(\?|$)/i, '$1$2$3'),
-        t => t.replace(/(\d+)t(\.[a-z]+)(\?|$)/i, '$1$2$3'),
-        t => t.replace(/\/thumbs?\//i, '/'),
-        t => t.replace(/[-_.]thumb(nail)?(?=\.[a-z]+(\?|$))/i, ''),
-        t => t.replace(/\/thumb(nail)?s?[-_]/i, '/'),
-        t => t.replace(/\/\/t(\d*)\./, '//i$1.')
-    ]
     if (fulls.some(x => !x) || thumbs.some(x => !x)) return null
-    for (const r of rules) if (thumbs.every((t, i) => r(t) === fulls[i] && r(t) !== t)) return r
+    const atoms: ((t: string) => string)[] = [
+        t => t.replace(/\/\/t(\d*)\./, '//i$1.'),                                  // t3.site -> i3.site
+        t => t.replace(/(\d+)t(\.[a-z0-9]+)(\?|$)/i, '$1$2$3'),                   // 12t.jpg -> 12.jpg
+        t => t.replace(/\/thumb(?:nail)?s?\//i, '/'),                            // /thumbnail/ -> /
+        t => t.replace(/[-_.]thumb(?:nail)?(?=\.[a-z0-9]+(\?|$))/i, ''),         // 12-thumb.jpg -> 12.jpg
+        t => t.replace(/\/thumb(?:nail)?s?[-_]/i, '/'),                           // /thumb_12.jpg -> /12.jpg
+        t => t.replace(/\/(?:small|mini|preview|thumbs?)\//i, '/full/'),          // /small/ -> /full/
+        t => t.replace(/[-_]?\d{2,4}x\d{2,4}(?=\.[a-z0-9]+(\?|$))/i, '')          // 12-200x280.jpg -> 12.jpg
+    ]
+    // Toutes les combinaisons, des plus simples aux plus complexes
+    const combos: number[][] = []
+    for (let mask = 1; mask < (1 << atoms.length); mask++) {
+        const ids: number[] = []
+        for (let i = 0; i < atoms.length; i++) if (mask & (1 << i)) ids.push(i)
+        combos.push(ids)
+    }
+    combos.sort((x, y) => x.length - y.length)
+    for (const ids of combos) {
+        const rule = (t: string): string => ids.reduce((acc, i) => (atoms[i] as (s: string) => string)(acc), t)
+        if (thumbs.every((t, i) => rule(t) === fulls[i] && rule(t) !== t)) return rule
+    }
     return null
 }
 
