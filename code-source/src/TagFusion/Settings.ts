@@ -1,9 +1,10 @@
 import { DUISection } from '@paperback/types'
 import { Store } from './Store'
-import { parseSiteList, siteIdOf } from './Utils'
+import { parseRepoList, parseSiteList, siteIdOf } from './Utils'
 
 export interface SettingsActions {
     discoverAll(force: boolean): Promise<void>
+    importRepos(): Promise<void>
 }
 
 const ENGINE_LABEL: Record<string, string> = {
@@ -19,6 +20,35 @@ export async function buildSettings(store: Store, actions: SettingsActions): Pro
         header: 'TagFusion',
         isHidden: false,
         rows: async () => [
+            App.createDUINavigationButton({
+                id: 'repos_nav',
+                label: 'Importer les sites de mes dépôts',
+                form: App.createDUIForm({
+                    sections: async () => [
+                        App.createDUISection({
+                            id: 'repos_section',
+                            header: 'Dépôts d\'extensions',
+                            footer: 'Colle les liens de tes dépôts d\'extensions, séparés par des virgules. Tu les trouves dans Paperback > Réglages > Sources externes (ou Dépôts). TagFusion récupère alors tous les sites de ces dépôts, puis revérifie chaque jour s\'il y en a de nouveaux. Tu peux retirer ceux que tu ne veux pas dans « Mes sites ».',
+                            isHidden: false,
+                            rows: async () => [
+                                App.createDUIInputField({
+                                    id: 'repos',
+                                    label: 'Dépôts',
+                                    value: App.createDUIBinding({
+                                        get: async () => (await store.getRepos()).map(u => u.replace(/\/versioning\.json$/, '')).join(', '),
+                                        set: async (v: unknown) => { try { await store.setRepos(parseRepoList(String(v ?? ''))) } catch { /* ignoré */ } }
+                                    })
+                                }),
+                                App.createDUIButton({
+                                    id: 'repos_import',
+                                    label: 'Importer les sites maintenant',
+                                    onTap: async () => { try { await actions.importRepos() } catch { /* voir le journal */ } }
+                                })
+                            ]
+                        })
+                    ]
+                })
+            }),
             App.createDUINavigationButton({
                 id: 'sites_nav',
                 label: 'Mes sites',

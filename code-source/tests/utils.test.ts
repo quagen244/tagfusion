@@ -162,3 +162,21 @@ assert.equal(safeUrl('https://s.com/a%20b.jpg'), 'https://s.com/a%20b.jpg')
 assert.equal(safeUrl('https://s.com/100%.jpg'), 'https://s.com/100%25.jpg')
 assert.equal(safeUrl('https://s.com/a|b.jpg'), 'https://s.com/a%7Cb.jpg')
 console.log('✓ URLs d\'images sûres')
+
+// --- Import depuis les dépôts d'extensions -----------------------------------------
+import { parseRepoList, repoVersioningUrl, sitesFromVersioning } from '../src/TagFusion/Utils'
+assert.equal(repoVersioningUrl('https://x.github.io/repo/0.8/'), 'https://x.github.io/repo/0.8/versioning.json')
+assert.equal(repoVersioningUrl('x.github.io/repo/versioning.json'), 'https://x.github.io/repo/versioning.json')
+assert.equal(repoVersioningUrl('rien'), null)
+assert.deepEqual(parseRepoList('a.github.io/r, https://b.netlify.app/0.8/ a.github.io/r/'), [
+    'https://a.github.io/r/versioning.json', 'https://b.netlify.app/0.8/versioning.json'])
+assert.deepEqual(sitesFromVersioning({ sources: [
+    { id: 'A', websiteBaseURL: 'https://www.site-un.com/' },
+    { id: 'B', websiteBaseURL: 'https://site-deux.net/manga' },
+    { id: 'C', websiteBaseURL: 'https://paperback.moe' },
+    { id: 'D', websiteBaseURL: 'https://quelquun.github.io/x' },
+    { id: 'E' },
+    { id: 'F', websiteBaseURL: 'https://www.site-un.com' }
+] }), ['https://www.site-un.com', 'https://site-deux.net'])
+assert.deepEqual(sitesFromVersioning('pas du json'), [])
+console.log('✓ Import des dépôts')

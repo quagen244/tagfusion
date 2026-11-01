@@ -419,3 +419,43 @@ export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) =>
     await Promise.all(workers)
     return results
 }
+
+// --- Import depuis des dépôts d'extensions Paperback --------------------------
+
+/** "https://x.github.io/repo/0.8/" ou ".../versioning.json" -> URL du versioning.json */
+export function repoVersioningUrl(repo: string): string | null {
+    let s = repo.trim()
+    if (s === '') return null
+    if (!/^https?:\/\//i.test(s)) s = 'https://' + s
+    if (!/^https?:\/\/[^/\s]+\.[^/\s]+/i.test(s)) return null
+    s = s.replace(/[?#].*$/, '').replace(/\/versioning\.json$/i, '').replace(/\/+$/, '')
+    return `${s}/versioning.json`
+}
+
+export function parseRepoList(input: string): string[] {
+    const out: string[] = []
+    for (const part of input.split(/[\s,;]+/)) {
+        const v = repoVersioningUrl(part)
+        if (v && !out.includes(v)) out.push(v)
+    }
+    return out
+}
+
+/** Hôtes qui ne sont pas des sites de lecture (pages de projet, hébergeurs de dépôts...) */
+const NOT_READING_SITES = /(^|\.)(paperback\.moe|github\.io|github\.com|gitlab\.com|netlify\.app|vercel\.app|example\.com|localhost)$/i
+
+/** Adresses des sites listés dans un versioning.json de dépôt Paperback */
+export function sitesFromVersioning(json: unknown): string[] {
+    const sources = (json && typeof json === 'object' && Array.isArray((json as { sources?: unknown }).sources))
+        ? (json as { sources: unknown[] }).sources : []
+    const out: string[] = []
+    for (const src of sources) {
+        if (!src || typeof src !== 'object') continue
+        const url = (src as { websiteBaseURL?: unknown }).websiteBaseURL
+        if (typeof url !== 'string') continue
+        const base = normalizeBaseUrl(url)
+        if (!base || NOT_READING_SITES.test(siteIdOf(base)) || out.includes(base)) continue
+        out.push(base)
+    }
+    return out
+}

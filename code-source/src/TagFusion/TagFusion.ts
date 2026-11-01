@@ -23,11 +23,11 @@ import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
 import {
     decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
-    mapLimit, safeDate, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, tagIdOf, titleKey
+    mapLimit, safeDate, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.0.3',
+    version: '1.0.4',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -165,6 +165,37 @@ export class TagFusion extends Source {
         await mapLimit(todo, 3, id => this.discoverSite(id, deadline))
     }
 
+    /** Ajoute à « Mes sites » tous les sites listés dans les dépôts d'extensions de l'utilisateur */
+    async importRepos(): Promise<number> {
+        const repos = await this.store.getRepos()
+        if (repos.length === 0) return 0
+        const current = await this.store.getSites()
+        const found: string[] = []
+        for (const repo of repos) {
+            try {
+                const json = JSON.parse(await this.fetcher.get(repo)) as unknown
+                const sites = sitesFromVersioning(json)
+                found.push(...sites)
+                await this.debug(`dépôt ${repo.replace(/^https?:\/\//, '').replace(/\/versioning\.json$/, '')} : ${sites.length} site(s)`)
+            } catch (e) {
+                await this.debug(`dépôt ${repo} illisible : ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+        const known = new Set(current.map(siteIdOf))
+        const added = found.filter(b => !known.has(siteIdOf(b)) && (known.add(siteIdOf(b)), true))
+        if (added.length) await this.store.setSites([...current, ...added])
+        await this.store.setReposImportedAt(Date.now())
+        await this.debug(`import des dépôts : ${added.length} nouveau(x) site(s)`)
+        return added.length
+    }
+
+    /** Réimporte les dépôts une fois par jour au plus */
+    private async importReposIfDue(): Promise<void> {
+        if ((await this.store.getRepos()).length === 0) return
+        if (Date.now() - await this.store.getReposImportedAt() < 864e5) return
+        await this.importRepos()
+    }
+
     /** Lit une fiche, et en profite pour apprendre ses tags */
     private async fetchDetails(siteId: string, url: string): Promise<Details> {
         const cached = this.detailsCache.get(url)
@@ -187,7 +218,10 @@ export class TagFusion extends Source {
     // =========================================================================
 
     override async getSourceMenu(): Promise<DUISection> {
-        return buildSettings(this.store, { discoverAll: force => this.discoverAll(force) })
+        return buildSettings(this.store, {
+            discoverAll: force => this.discoverAll(force),
+            importRepos: async () => { await this.importRepos(); await this.discoverAll(false) }
+        })
     }
 
     override async getCloudflareBypassRequestAsync(): Promise<Request> {
@@ -202,13 +236,16 @@ export class TagFusion extends Source {
     override async getSearchTags(): Promise<TagSection[]> {
         await this.debug('écran de recherche : demande des tags')
         try {
+            // Les dépôts d'extensions renseignés apportent leurs sites automatiquement
+            if ((await this.store.getSites()).length === 0) await this.importReposIfDue()
+            else this.importReposIfDue().catch(() => undefined)
             const sites = await this.store.getSites()
             // Jamais de liste vide ni de section vide : Paperback 0.8 les supporte mal
             if (sites.length === 0) {
                 await this.debug('écran de recherche : aucun site configuré')
                 return [App.createTagSection({
                     id: 'info', label: 'Aucun site configuré',
-                    tags: [App.createTag({ id: 'info_nosites', label: 'Ajoute tes sites dans les réglages' })]
+                    tags: [App.createTag({ id: 'info_nosites', label: 'Ajoute tes sites ou tes dépôts dans les réglages' })]
                 })]
             }
 

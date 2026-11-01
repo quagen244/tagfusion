@@ -187,6 +187,27 @@ export class Store {
         return tagKey(label, await this.customMerges())
     }
 
+    // --- Dépôts d'extensions dont on importe les sites ---------------------------
+
+    async getRepos(): Promise<string[]> {
+        const v = await this.state.retrieve('tf_repos')
+        return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+    }
+
+    async setRepos(urls: string[]): Promise<void> {
+        await this.state.store('tf_repos', urls)
+        await this.state.store('tf_repos_imported_at', 0)
+    }
+
+    async getReposImportedAt(): Promise<number> {
+        const v = await this.state.retrieve('tf_repos_imported_at')
+        return typeof v === 'number' ? v : 0
+    }
+
+    async setReposImportedAt(t: number): Promise<void> {
+        await this.state.store('tf_repos_imported_at', t)
+    }
+
     // --- Journal de diagnostic -------------------------------------------------
 
     async getDebugLines(): Promise<string[]> {
