@@ -27,7 +27,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.0.2',
+    version: '1.0.3',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -200,10 +200,17 @@ export class TagFusion extends Source {
     }
 
     override async getSearchTags(): Promise<TagSection[]> {
+        await this.debug('écran de recherche : demande des tags')
         try {
             const sites = await this.store.getSites()
-            // Aucune section vide : Paperback 0.8 les supporte mal
-            if (sites.length === 0) return []
+            // Jamais de liste vide ni de section vide : Paperback 0.8 les supporte mal
+            if (sites.length === 0) {
+                await this.debug('écran de recherche : aucun site configuré')
+                return [App.createTagSection({
+                    id: 'info', label: 'Aucun site configuré',
+                    tags: [App.createTag({ id: 'info_nosites', label: 'Ajoute tes sites dans les réglages' })]
+                })]
+            }
 
             // Si on ne connaît encore aucun tag, on attend la découverte (avec une limite de temps).
             // Sinon, on complète en arrière-plan pour ne pas bloquer l'écran de recherche.
@@ -235,9 +242,14 @@ export class TagFusion extends Source {
             for (const [letter, tags] of [...byLetter.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
                 if (tags.length) sections.push(App.createTagSection({ id: `letter_${letter}`, label: letter === 'other' ? '#' : letter, tags }))
             }
+            await this.debug(`écran de recherche : ${sections.length} section(s), ${unified.length} tag(s) envoyés à l'app`)
             return sections
-        } catch {
-            return []
+        } catch (e) {
+            await this.debug(`écran de recherche : erreur ${e instanceof Error ? e.message : String(e)}`)
+            return [App.createTagSection({
+                id: 'info', label: 'Erreur',
+                tags: [App.createTag({ id: 'info_error', label: 'Voir le journal dans les réglages' })]
+            })]
         }
     }
 
@@ -246,6 +258,7 @@ export class TagFusion extends Source {
     // =========================================================================
 
     override async getSearchResults(query: SearchRequest, metadata: unknown): Promise<PagedResults> {
+        await this.debug('recherche : appel reçu de l\'app')
         try {
             return await this.doSearch(query, metadata)
         } catch (e) {
