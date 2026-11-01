@@ -1,6 +1,6 @@
 import { CheerioAPI, Element } from 'cheerio'
 import type { ChapterItem, Fetcher } from './Engines'
-import { absoluteUrl, hostOf, looksLikeTagUrl, parseDate, pathOf, pickImageSrc } from './Utils'
+import { absoluteUrl, hostOf, looksLikeTagUrl, parseDate, pathOf, pickImageSrc, tryDecodeURI } from './Utils'
 
 // ============================================================================
 // Lecture UNIVERSELLE des chapitres et des pages, quelle que soit la présentation du site.
@@ -74,7 +74,7 @@ export function parseChapterInfo(text: string, url: string): { num: number, volu
     let num = labelled?.[1] ? Number(labelled[1].replace(',', '.')) : NaN
     if (isNaN(num) && /^\d+(?:[.,]\d+)?$/.test(t)) num = Number(t.replace(',', '.'))
     if (isNaN(num)) {
-        const p = decodeURIComponent(pathOf(url)).replace(/[?#].*$/, '')
+        const p = tryDecodeURI(pathOf(url)).replace(/[?#].*$/, '')
         const fromUrl = /(?:chapter|chapitre|capitulo|kapitel|bolum|chuong|episode|ep|ch|chap|cap|c)[-_/.]?(\d+(?:[-_.]\d+)?)(?:[/?#.]|$)/i.exec(p) ?? /(\d+(?:[-.]\d+)?)\/?$/.exec(p)
         if (fromUrl?.[1]) num = Number(fromUrl[1].replace(/[-_]/, '.'))
     }
@@ -364,66 +364,82 @@ function dedupe(chs: ChapterItem[]): ChapterItem[] {
 /**
  * Trouve les chapitres d'une fiche, quelle que soit la présentation du site.
  * `$` = la fiche déjà chargée. Les autres pages ne sont demandées que si nécessaire.
+ * Chaque méthode est protégée : une erreur dans l'une passe simplement à la suivante.
+ * `log` reçoit le compte rendu de chaque méthode (pour le journal de diagnostic).
  */
-export async function universalChapters(f: Fetcher, mangaUrl: string, $: CheerioAPI, base: string): Promise<ChapterItem[]> {
+export async function universalChapters(f: Fetcher, mangaUrl: string, $: CheerioAPI, base: string, log: (line: string) => void = () => undefined): Promise<ChapterItem[]> {
+    let chapters: ChapterItem[] = []
+    const better = (list: ChapterItem[]): void => { if (list.length > chapters.length) chapters = dedupe(list) }
+    const step = async (name: string, fn: () => Promise<ChapterItem[]> | ChapterItem[]): Promise<void> => {
+        try {
+            const list = await fn()
+            log(`${name} : ${list.length}`)
+            better(list)
+        } catch (e) {
+            log(`${name} : erreur ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
     let html = ''
     try { html = await f.get(mangaUrl) } catch { /* la fiche est déjà dans $ */ }
-    const better = (list: ChapterItem[]): void => { if (list.length > chapters.length) chapters = dedupe(list) }
 
     // 1. Éléments cliquables de la fiche (liens, data-href, onclick, grilles de numéros)
-    const cands = pickChapterList(chapterCandidates($, mangaUrl, base, mangaUrl), mangaUrl)
-    let chapters = toItems(cands)
+    let cands: Candidate[] = []
+    await step('liens de la fiche', () => {
+        cands = pickChapterList(chapterCandidates($, mangaUrl, base, mangaUrl), mangaUrl)
+        return toItems(cands)
+    })
     if (chapters.length >= 2) {
         // La liste de la fiche est peut-être paginée : on suit ses pages
-        const more = await followListPagination(f, $, mangaUrl, base, mangaUrl, cands)
-        if (more.length) chapters = dedupe([...chapters, ...more])
+        await step('pages suivantes de la liste', async () => {
+            const more = await followListPagination(f, $, mangaUrl, base, mangaUrl, cands)
+            return more.length ? [...chapters, ...more] : []
+        })
         return sortNewestFirst(chapters)
     }
 
     // 2. Données structurées de la page (__NEXT_DATA__, JSON-LD…)
-    better(chaptersFromPageJson($, mangaUrl, base, mangaUrl))
+    await step('données structurées', () => chaptersFromPageJson($, mangaUrl, base, mangaUrl))
 
     // 3. Balayage du code brut (sites Next.js récents, listes dans les scripts)
-    if (chapters.length < 2 && html) better(chaptersFromRawText(html, mangaUrl, base, mangaUrl))
+    if (chapters.length < 2 && html) await step('code brut', () => chaptersFromRawText(html, mangaUrl, base, mangaUrl))
 
     // 4. Liste chargée depuis une adresse annexe (/ajax/…, /api/…)
-    if (chapters.length < 2 && html) {
-        try { better(await chaptersFromEndpoints(f, $, html, mangaUrl, base)) } catch { /* pas d'adresse annexe utilisable */ }
-    }
+    if (chapters.length < 2 && html) await step('adresse annexe', () => chaptersFromEndpoints(f, $, html, mangaUrl, base))
 
     // 5. Page "tous les chapitres" séparée (et sa pagination)
     if (chapters.length < 2) {
-        const links: string[] = []
-        $('a[href]').each((_, el) => {
-            const text = clean($(el).text()) + ' ' + clean($(el).attr('title'))
-            const href = absoluteUrl($(el).attr('href'), mangaUrl)
-            if (!href || !sameSite(href, base)) return
-            if (ALL_CHAPTERS_RE.test(text) || /\/(chapters?|chapter-list|episodes|chapitres)\/?(\?|$)/i.test(pathOf(href))) links.push(href)
+        await step('page « tous les chapitres »', async () => {
+            const links: string[] = []
+            $('a[href]').each((_, el) => {
+                const text = clean($(el).text()) + ' ' + clean($(el).attr('title'))
+                const href = absoluteUrl($(el).attr('href'), mangaUrl)
+                if (!href || !sameSite(href, base)) return
+                if (ALL_CHAPTERS_RE.test(text) || /\/(chapters?|chapter-list|episodes|chapitres)\/?(\?|$)/i.test(pathOf(href))) links.push(href)
+            })
+            const slash = mangaUrl.replace(/[?#].*$/, '').replace(/\/?$/, '/')
+            const guesses = [...links, slash + 'chapters', slash + 'chapters/', mangaUrl.replace(/[?#].*$/, '') + '?tab=chapters']
+            let best: ChapterItem[] = []
+            for (const pageUrl of [...new Set(guesses)].slice(0, 5)) {
+                try {
+                    const list = await chaptersAcrossPages(f, pageUrl, base, mangaUrl)
+                    if (list.length > best.length) { best = list; if (list.length >= 2) break }
+                } catch { /* page absente : on essaie la suivante */ }
+            }
+            return best
         })
-        const slash = mangaUrl.replace(/[?#].*$/, '').replace(/\/?$/, '/')
-        const guesses = [...links, slash + 'chapters', slash + 'chapters/', mangaUrl.replace(/[?#].*$/, '') + '?tab=chapters']
-        for (const pageUrl of [...new Set(guesses)].slice(0, 5)) {
-            try {
-                const list = await chaptersAcrossPages(f, pageUrl, base, mangaUrl)
-                if (list.length > chapters.length) { chapters = list; if (list.length >= 2) break }
-            } catch { /* page absente : on essaie la suivante */ }
-        }
     }
 
     // 6. Ouvrir un chapitre et lire le menu déroulant (ou la liste) de son lecteur
     if (chapters.length < 2) {
-        const first = chapters[0]?.url ?? firstReadLink($, mangaUrl, base)
-        if (first) {
-            try {
-                const $c = f.load(await f.get(first))
-                const fromSelect = chaptersFromSelect($c, first, base)
-                if (fromSelect.length > chapters.length) chapters = fromSelect
-                else {
-                    const fromReader = toItems(pickChapterList(chapterCandidates($c, first, base, mangaUrl), mangaUrl))
-                    if (fromReader.length >= 2) chapters = dedupe([...chapters, ...fromReader])
-                }
-            } catch { /* chapitre illisible */ }
-        }
+        await step('lecteur', async () => {
+            const first = chapters[0]?.url ?? firstReadLink($, mangaUrl, base)
+            if (!first) return []
+            const $c = f.load(await f.get(first))
+            const fromSelect = chaptersFromSelect($c, first, base)
+            if (fromSelect.length >= 2) return fromSelect
+            const fromReader = toItems(pickChapterList(chapterCandidates($c, first, base, mangaUrl), mangaUrl))
+            return fromReader.length >= 2 ? [...chapters, ...fromReader] : []
+        })
     }
     return sortNewestFirst(dedupe(chapters))
 }

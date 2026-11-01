@@ -5,6 +5,8 @@ import { parseRepoList, parseSiteList, siteIdOf } from './Utils'
 export interface SettingsActions {
     discoverAll(force: boolean): Promise<void>
     importRepos(): Promise<void>
+    diagnose(url: string): Promise<void>
+    reset(full: boolean): Promise<void>
 }
 
 const ENGINE_LABEL: Record<string, string> = {
@@ -112,10 +114,44 @@ export async function buildSettings(store: Store, actions: SettingsActions): Pro
                 label: 'Journal (diagnostic)',
                 value: await store.getDebugLines().then(l => l.length ? l.join('\n') : 'Vide pour l\'instant.').catch(() => 'Indisponible.')
             }),
+            App.createDUINavigationButton({
+                id: 'diag_nav',
+                label: 'Diagnostic d\'un manga',
+                form: App.createDUIForm({
+                    sections: async () => [
+                        App.createDUISection({
+                            id: 'diag_section',
+                            header: 'Analyser un manga',
+                            footer: 'Colle l\'adresse complète d\'un manga (copiée depuis le navigateur), puis touche « Analyser ». Le résultat détaillé apparaît dans « Journal (diagnostic) » sur l\'écran précédent.',
+                            isHidden: false,
+                            rows: async () => [
+                                App.createDUIInputField({
+                                    id: 'diag_url',
+                                    label: 'Adresse',
+                                    value: App.createDUIBinding({
+                                        get: async () => store.getDiagUrl(),
+                                        set: async (v: unknown) => { try { await store.setDiagUrl(String(v ?? '')) } catch { /* ignoré */ } }
+                                    })
+                                }),
+                                App.createDUIButton({
+                                    id: 'diag_run',
+                                    label: 'Analyser',
+                                    onTap: async () => { try { await actions.diagnose(await store.getDiagUrl()) } catch { /* voir le journal */ } }
+                                })
+                            ]
+                        })
+                    ]
+                })
+            }),
             App.createDUIButton({
-                id: 'clear',
-                label: 'Effacer tous les tags appris',
-                onTap: async () => { try { await store.clearTags() } catch { /* rien à faire */ } }
+                id: 'reset_index',
+                label: 'Effacer l\'index et les tags (garde mes sites)',
+                onTap: async () => { try { await actions.reset(false) } catch { /* rien à faire */ } }
+            }),
+            App.createDUIButton({
+                id: 'reset_all',
+                label: 'Tout réinitialiser (sites compris)',
+                onTap: async () => { try { await actions.reset(true) } catch { /* rien à faire */ } }
             })
         ]
     })

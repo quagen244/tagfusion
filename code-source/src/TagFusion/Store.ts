@@ -26,6 +26,8 @@ export interface SiteInfo {
     name?: string
     discoveredAt?: number
     error?: string
+    /** Page du catalogue complet du site ('' = aucune trouvée) */
+    catalog?: string
 }
 
 /** Un manga dont on a lu la fiche, avec tous ses tags (liens ou non) */
@@ -231,6 +233,11 @@ export class Store {
         })
     }
 
+    /** Un manga déjà indexé (ses tags sont connus sans relire sa fiche) */
+    async getIndexed(mangaId: string): Promise<IndexedManga | undefined> {
+        return (await this.getIndex())[mangaId]
+    }
+
     /** Mangas indexés qui ont tous les tags demandés et aucun des tags exclus */
     async searchIndex(included: string[], excluded: string[], sites?: string[]): Promise<(IndexedManga & { id: string })[]> {
         const index = await this.getIndex(true)
@@ -329,6 +336,47 @@ export class Store {
 
     async setReposImportedAt(t: number): Promise<void> {
         await this.state.store('tf_repos_imported_at', t)
+    }
+
+    // --- Remise à zéro ----------------------------------------------------------
+
+    /**
+     * Efface l'index des mangas, les tags appris, l'état des sites (moteur détecté, erreurs),
+     * la liste Cloudflare et le journal. Avec `full`, efface aussi les sites, les dépôts et les fusions.
+     */
+    async resetAll(full: boolean): Promise<void> {
+        await this.serial(async () => {
+            for (const k of [K_RAW, K_INDEX, K_INFO]) await this.state.store(k, {})
+            await this.state.store(K_CF, [])
+            await this.state.store('tf_debug', [])
+            await this.state.store('tf_repos_imported_at', 0)
+            if (full) {
+                await this.state.store(K_SITES, [])
+                await this.state.store('tf_repos', [])
+                await this.state.store(K_MERGES, '')
+                this.sitesCache = []
+            } else {
+                // On garde les sites, avec une fiche vierge pour chacun
+                const sites = await this.getSites()
+                const info: Record<string, SiteInfo> = {}
+                for (const b of sites) info[siteIdOf(b)] = { base: b }
+                await this.state.store(K_INFO, info)
+            }
+            this.raw = { data: {}, at: Date.now() }
+            this.index = { data: {}, at: Date.now() }
+            this.info = undefined
+            this.cfBlocked = []
+            this.unifiedCache = undefined
+        })
+    }
+
+    async getDiagUrl(): Promise<string> {
+        const v = await this.state.retrieve('tf_diag_url')
+        return typeof v === 'string' ? v : ''
+    }
+
+    async setDiagUrl(v: string): Promise<void> {
+        await this.state.store('tf_diag_url', v)
     }
 
     // --- Journal de diagnostic -------------------------------------------------

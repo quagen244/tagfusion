@@ -40,6 +40,8 @@ export interface Engine {
     detect(html: string): boolean
     /** Pages à lire pour découvrir la liste complète des tags du site */
     discoveryPages(base: string): string[]
+    /** Pages possibles du catalogue complet du site (tous les mangas), dans l'ordre d'essai */
+    catalogPages(base: string): string[]
     parseTags($: CheerioAPI, pageUrl: string, base: string, onDetailsPage: boolean): SiteTag[]
     listingUrl(tag: SiteTag, page: number): string
     /** URL d'une recherche "tous ces tags à la fois", si le site sait le faire */
@@ -47,7 +49,7 @@ export interface Engine {
     searchUrl(base: string, title: string, page: number): string
     parseListing($: CheerioAPI, pageUrl: string, base: string): ListingItem[]
     parseDetails($: CheerioAPI, url: string, base: string): Details
-    getChapters(f: Fetcher, mangaUrl: string, $: CheerioAPI, base: string): Promise<ChapterItem[]>
+    getChapters(f: Fetcher, mangaUrl: string, $: CheerioAPI, base: string, log?: (line: string) => void): Promise<ChapterItem[]>
     chapterPageUrl(chapterUrl: string): string
     parsePages($: CheerioAPI, html: string, url: string): string[]
 }
@@ -226,13 +228,14 @@ export const GenericEngine: Engine = {
     name: 'generic',
     detect: () => true,
     discoveryPages: base => [`${base}/`, `${base}/genres`, `${base}/genre`, `${base}/tags`, `${base}/manga`, `${base}/search`],
+    catalogPages: base => [`${base}/manga/`, `${base}/manga-list/`, `${base}/series/`, `${base}/comics/`, `${base}/comic/`, `${base}/manhwa/`, `${base}/directory/`, `${base}/latest/`, `${base}/`],
     parseTags: ($, _pageUrl, base, onDetails) => genericTagLinks($, base, onDetails),
     listingUrl: (tag, page) => pagedUrl(tag.url, page),
     combinedUrl: () => null,
     searchUrl: (base, title, page) => pagedUrl(`${base}/?s=${encodeURIComponent(title)}`, page),
     parseListing: genericListing,
     parseDetails: genericDetails,
-    getChapters: (f, mangaUrl, $, base) => universalChapters(f, mangaUrl, $, base),
+    getChapters: (f, mangaUrl, $, base, log) => universalChapters(f, mangaUrl, $, base, log),
     chapterPageUrl: u => u,
     parsePages: universalPages
 }
@@ -247,6 +250,7 @@ export const MadaraEngine: Engine = {
     name: 'madara',
     detect: html => /wp-manga|madara|\/manga-genre\//i.test(html),
     discoveryPages: base => [`${base}/?s=&post_type=wp-manga`, `${base}/`],
+    catalogPages: base => [`${base}/manga/`, `${base}/?s=&post_type=wp-manga&m_orderby=latest`, `${base}/`],
     parseTags: ($, pageUrl, base, onDetails) => {
         const tags: SiteTag[] = []
         if (onDetails) {
@@ -316,7 +320,7 @@ export const MadaraEngine: Engine = {
             tags: mergeTags(MadaraEngine.parseTags($, url, base, true), zoneTags($, url, base))
         }
     },
-    getChapters: async (f, mangaUrl, $, base) => {
+    getChapters: async (f, mangaUrl, $, base, log) => {
         const parse = (c: CheerioAPI): ChapterItem[] => {
             const out: ChapterItem[] = []
             c('li.wp-manga-chapter').each((_, el) => {
@@ -330,7 +334,8 @@ export const MadaraEngine: Engine = {
             })
             return out
         }
-        let chs = parse($)
+        let chs: ChapterItem[] = []
+        try { chs = parse($) } catch { chs = [] }
         if (chs.length === 0) {
             // Madara récent : les chapitres arrivent par une requête à part
             const ajaxUrl = mangaUrl.replace(/\/?$/, '/') + 'ajax/chapters/'
@@ -348,7 +353,8 @@ export const MadaraEngine: Engine = {
                 } catch { chs = [] }
             }
         }
-        return chs.length ? sortNewestFirst(chs) : universalChapters(f, mangaUrl, $, base)
+        log?.(`madara : ${chs.length}`)
+        return chs.length ? sortNewestFirst(chs) : universalChapters(f, mangaUrl, $, base, log)
     },
     chapterPageUrl: u => u.includes('?') ? u : u.replace(/\/?$/, '/') + '?style=list',
     parsePages: ($, html, url) => {
@@ -367,6 +373,7 @@ export const ThemesiaEngine: Engine = {
     name: 'themesia',
     detect: html => /ts_reader|bixbox|class="bsx"|themes\/mangareader|mangastream|themesia/i.test(html),
     discoveryPages: base => [`${base}/manga/`, `${base}/`],
+    catalogPages: base => [`${base}/manga/?order=update`, `${base}/manga/`, `${base}/`],
     parseTags: ($, pageUrl, base, onDetails) => {
         if (onDetails) {
             const tags: SiteTag[] = []
@@ -423,9 +430,9 @@ export const ThemesiaEngine: Engine = {
             tags: mergeTags(ThemesiaEngine.parseTags($, url, base, true), zoneTags($, url, base))
         }
     },
-    getChapters: async (f, mangaUrl, $, base) => {
+    getChapters: async (f, mangaUrl, $, base, log) => {
         const out: ChapterItem[] = []
-        $('#chapterlist li, .eplister li, .clstyle li').each((_, el) => {
+        try { $('#chapterlist li, .eplister li, .clstyle li').each((_, el) => {
             const a = $(el).find('a').first()
             const url = absoluteUrl(a.attr('href'), mangaUrl)
             if (!url) return
@@ -436,8 +443,9 @@ export const ThemesiaEngine: Engine = {
                 num: isNaN(dataNum) || $(el).attr('data-num') === undefined ? parseChapterNumber(name, url) : dataNum,
                 date: parseDate(clean($(el).find('.chapterdate').text()))
             })
-        })
-        return out.length ? sortNewestFirst(out) : universalChapters(f, mangaUrl, $, base)
+        }) } catch { out.length = 0 }
+        log?.(`mangareader : ${out.length}`)
+        return out.length ? sortNewestFirst(out) : universalChapters(f, mangaUrl, $, base, log)
     },
     chapterPageUrl: u => u,
     parsePages: ($, html, url) => {

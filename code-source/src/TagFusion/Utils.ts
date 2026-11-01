@@ -65,6 +65,11 @@ export function safeDecode(s: string): string {
     return decodeURIComponent(s.replace(/_/g, '%'))
 }
 
+/** decodeURIComponent qui ne plante jamais (une adresse avec un "%" mal formé lève une erreur sinon) */
+export function tryDecodeURI(s: string): string {
+    try { return decodeURIComponent(s) } catch { return s }
+}
+
 const ID_SEP = '\n'
 
 export function encodeMangaId(siteId: string, url: string): string {
@@ -72,10 +77,14 @@ export function encodeMangaId(siteId: string, url: string): string {
 }
 
 export function decodeMangaId(mangaId: string): { siteId: string, path: string } {
-    const raw = safeDecode(mangaId)
+    // Ancien format des toutes premières versions : "site.com::/manga/x/"
+    const legacy = mangaId.indexOf('::')
+    if (legacy > 0) return { siteId: mangaId.slice(0, legacy), path: mangaId.slice(legacy + 2) || '/' }
+    let raw = ''
+    try { raw = safeDecode(mangaId) } catch { raw = '' }
     const i = raw.indexOf(ID_SEP)
-    if (i < 0) throw new Error(`ID de manga invalide : ${mangaId}`)
-    return { siteId: raw.slice(0, i), path: raw.slice(i + ID_SEP.length) }
+    if (i < 0) throw new Error(`ID de manga illisible : ${mangaId.slice(0, 60)}`)
+    return { siteId: raw.slice(0, i), path: raw.slice(i + ID_SEP.length) || '/' }
 }
 
 export function encodeChapterId(url: string): string {
@@ -83,7 +92,15 @@ export function encodeChapterId(url: string): string {
 }
 
 export function decodeChapterId(chapterId: string): string {
-    return safeDecode(chapterId)
+    // Ancien format : le chemin tel quel ("/manga/x/chapter-1/")
+    if (chapterId.startsWith('/')) return chapterId
+    if (/^https?:\/\//i.test(chapterId)) return pathOf(chapterId)
+    try {
+        const p = safeDecode(chapterId)
+        return p.startsWith('/') ? p : '/' + p
+    } catch {
+        return '/' + chapterId
+    }
 }
 
 /** ID de tag pour Paperback : "tag_sci-fi" <-> clé "sci fi" */
@@ -375,7 +392,7 @@ export function pagedUrl(url: string, page: number): string {
 /** Numéro de chapitre depuis un texte ou une URL. -1 si introuvable. */
 export function parseChapterNumber(text: string, url = ''): number {
     const labelled = /(?:chapter|chapitre|chap|ch|capitulo|cap|episode|ep|#)\s*[.:\-#]?\s*(\d+(?:[.,]\d+)?)/i
-    for (const s of [text, decodeURIComponent(pathOf(url || '/')).replace(/[-_/]/g, ' ')]) {
+    for (const s of [text, tryDecodeURI(pathOf(url || '/')).replace(/[-_/]/g, ' ')]) {
         const m = labelled.exec(s)
         if (m?.[1]) return Number(m[1].replace(',', '.'))
     }
