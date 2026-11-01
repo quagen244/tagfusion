@@ -228,7 +228,7 @@ export const GenericEngine: Engine = {
     name: 'generic',
     detect: () => true,
     discoveryPages: base => [`${base}/`, `${base}/genres`, `${base}/genre`, `${base}/tags`, `${base}/manga`, `${base}/search`],
-    catalogPages: base => [`${base}/manga/`, `${base}/manga-list/`, `${base}/series/`, `${base}/comics/`, `${base}/comic/`, `${base}/manhwa/`, `${base}/directory/`, `${base}/latest/`, `${base}/`],
+    catalogPages: base => [`${base}/manga/`, `${base}/series/`, `${base}/manga-list/`, `${base}/`],
     parseTags: ($, _pageUrl, base, onDetails) => genericTagLinks($, base, onDetails),
     listingUrl: (tag, page) => pagedUrl(tag.url, page),
     combinedUrl: () => null,

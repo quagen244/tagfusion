@@ -67,6 +67,10 @@ test('Reconnaissance des liens', () => {
     assert.ok(!looksLikeMangaUrl('https://s.com/manga/solo-leveling/chapter-12/'))
     assert.ok(looksLikeChapterUrl('https://s.com/manga/solo-leveling/chapter-12/'))
     assert.ok(looksLikeChapterUrl('https://s.com/solo-leveling-chapitre-3/'))
+    assert.ok(looksLikeMangaUrl('https://s.com/manga/c1m1/'), 'un manga nommé c1m1 reste un manga')
+    assert.ok(looksLikeMangaUrl('https://s.com/manga/ep1c-story/'))
+    assert.ok(looksLikeChapterUrl('https://s.com/manga/x/c12/'))
+    assert.ok(looksLikeChapterUrl('https://s.com/manga/x/ch-3'))
 })
 
 test('Pagination', () => {

@@ -87,6 +87,7 @@ export function parseChapterInfo(text: string, url: string): { num: number, volu
     name = name.replace(/^(?:(?:vol(?:ume)?|tome|t)\.?\s*\d+[\s,.:-]*)?(?:chapter|chapitre|chap|ch|capitulo|capítulo|cap|kapitel|bölüm|bolum|episode|épisode|episodio|ep|chương|chuong|#)\s*\.?\s*[-:#]?\s*\d+(?:[.,]\d+)?/i, '')
         .replace(/^第\s*\d+(?:\.\d+)?\s*[话話章回]/, '')
         .replace(/^\d+(?:[.,]\d+)?$/, '')
+        .replace(/^\d+(?:[.,]\d+)?\s*[-:.)–—]\s+/, '')
         .replace(/^[\s:|·•–—-]+/, '').replace(/[\s:|·•–—-]+$/, '')
     name = clean(name)
     return { num: isNaN(num) || !isFinite(num) ? -1 : num, volume: vol?.[1] ? Number(vol[1]) : 0, name }
@@ -125,7 +126,10 @@ function chapterCandidates($: CheerioAPI, pageUrl: string, base: string, mangaUr
         if (isListOrPaging(p) || /\.(jpe?g|png|webp|gif|avif|css|js)(\?|$)/i.test(p)) return
         const text = clean($(el).attr('title')) || clean($(el).text())
         // Grille de numéros seuls ("1 2 3 … 120") sous la fiche du manga
-        const numberUnderManga = /^\d+(?:[.,]\d+)?$/.test(text) && mp.length > 1 && p.toLowerCase().startsWith(mp + '/')
+        const underManga = mp.length > 1 && p.toLowerCase().startsWith(mp + '/')
+        // Grille de numéros seuls, ou adresse "/titre/12/" avec un texte (pas une miniature de galerie)
+        const numberUnderManga = underManga && (/^\d+(?:[.,]\d+)?$/.test(text)
+            || (text.length > 0 && $(el).find('img').length === 0 && new RegExp(`^${mp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\d+(?:[.-]\\d+)?/?$`).test(p.toLowerCase().replace(/[?#].*$/, ''))))
         if (!CH_URL_RE.test(p) && !CH_TEXT_RE.test(text) && !numberUnderManga) return
         if (seen.has(u)) return
         seen.add(u)
@@ -441,7 +445,51 @@ export async function universalChapters(f: Fetcher, mangaUrl: string, $: Cheerio
             return fromReader.length >= 2 ? [...chapters, ...fromReader] : []
         })
     }
+    // 7. Aucune liste de chapitres mais une galerie (miniatures numérotées) : un chapitre unique
+    if (chapters.length === 0) {
+        await step('galerie (chapitre unique)', () => {
+            const thumbs = galleryLinks($, mangaUrl, mangaUrl)
+            const reader = readerImages($, mangaUrl)
+            return thumbs.length >= 2 || reader >= 3 ? [{ url: mangaUrl.replace(/[?#].*$/, ''), name: '', num: 1, date: parseDate('') }] : []
+        })
+    }
     return sortNewestFirst(dedupe(chapters))
+}
+
+/**
+ * Miniatures d'une galerie : liens avec une image vers des pages de lecture numérotées
+ * sous l'adresse de la galerie ("/g/123/1/", "/g/123/2/"…), triées par numéro.
+ */
+export function galleryLinks($: CheerioAPI, pageUrl: string, galleryUrl: string): { n: number, url: string, thumb: string }[] {
+    const gp = pathOf(galleryUrl).replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase()
+    if (gp.length < 2) return []
+    const out: { n: number, url: string, thumb: string }[] = []
+    const seen = new Set<number>()
+    $('a[href]').each((_, el) => {
+        const img = $(el).find('img').first()
+        if (img.length === 0) return
+        const url = absoluteUrl($(el).attr('href'), pageUrl)
+        if (!url || hostOf(url) !== hostOf(galleryUrl)) return
+        const m = /^(.*)\/(\d+)\/?$/.exec(pathOf(url).replace(/[?#].*$/, '').toLowerCase())
+        if (!m || m[1] !== gp) return
+        const n = Number(m[2])
+        if (seen.has(n)) return
+        seen.add(n)
+        const node = img.get(0) as Element | undefined
+        out.push({ n, url: url.replace(/#.*$/, ''), thumb: absoluteUrl(pickImageSrc(node?.attribs ?? {}), pageUrl) ?? '' })
+    })
+    return out.sort((a, b) => a.n - b.n)
+}
+
+/** Nombre d'images de lecture affichées directement sur une page (dans une zone de lecteur, hors liens) */
+function readerImages($: CheerioAPI, url: string): number {
+    let n = 0
+    $('[class*="reader"] img, [class*="reading"] img, [id*="reader"] img, [class*="viewer"] img, [class*="page-break"] img, #image-container img').each((_, el) => {
+        if ($(el).closest('a[href]').length) return
+        const src = absoluteUrl(pickImageSrc(el.attribs), url)
+        if (src && !NOT_PAGE.test(src)) n++
+    })
+    return n
 }
 
 /** Lien "Lire" / "Commencer" / "Premier chapitre" */
@@ -512,12 +560,31 @@ function imagesFromScriptArrays(html: string, pageUrl: string): string[] {
         try {
             const arr = JSON.parse(m[0].replace(/,\s*\]$/, ']')) as unknown
             if (!Array.isArray(arr)) continue
-            const urls = arr.filter((x): x is string => typeof x === 'string' && IMG_EXT.test(x))
-                .map(x => absoluteUrl(x.replace(/\\\//g, '/'), pageUrl)).filter((x): x is string => !!x && !NOT_PAGE.test(x))
+            const raw = arr.filter((x): x is string => typeof x === 'string' && IMG_EXT.test(x)).map(x => x.replace(/\\\//g, '/'))
+            const prefix = cdnPrefix(raw, html)
+            const urls = raw.map(x => prefix && !/^(https?:)?\/\//i.test(x) ? prefix + (x.startsWith('/') ? x : '/' + x) : absoluteUrl(x, pageUrl))
+                .filter((x): x is string => !!x && !NOT_PAGE.test(x))
             if (urls.length > best.length) best = urls
         } catch { /* pas du JSON valide */ }
     }
     return best
+}
+
+/**
+ * Images listées en chemins relatifs ("/hentai/abc/001.jpg") mais servies par un autre serveur :
+ * on cherche dans la page une adresse complète qui finit par l'un de ces chemins
+ * (souvent la première image déjà affichée) et on en déduit le début commun.
+ */
+function cdnPrefix(paths: string[], html: string): string | null {
+    const text = unescapeJs(html)
+    for (const p of paths.slice(0, 5)) {
+        if (/^(https?:)?\/\//i.test(p)) return null
+        const rel = p.startsWith('/') ? p : '/' + p
+        const esc = rel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const m = new RegExp(`(https?:\\/\\/[^\\s"'<>\\\\]+?)${esc}(?=["'\\s?#<>]|$)`, 'i').exec(text)
+        if (m?.[1]) return m[1]
+    }
+    return null
 }
 
 /** Images cachées dans <noscript> */
@@ -604,6 +671,54 @@ export function universalPages($: CheerioAPI, html: string, url: string): string
  * Vieux lecteurs "une image par page" : si une seule image est trouvée, on suit les pages
  * du chapitre (menu des pages ou lien "suivant") et on récupère l'image de chacune.
  */
+/**
+ * Pages d'une galerie, en taille réelle : chaque miniature mène à une page de lecture qui contient
+ * la grande image. On essaie de déduire l'adresse des grandes images depuis les miniatures
+ * (règle vérifiée sur la première, une du milieu et la dernière) ; sinon on ouvre chaque page.
+ */
+export async function galleryPages(f: Fetcher, $: CheerioAPI, url: string): Promise<string[]> {
+    const thumbs = galleryLinks($, url, url)
+    if (thumbs.length < 2) return []
+    const fullOf = async (pageUrl: string): Promise<string | undefined> => {
+        const h = await f.get(pageUrl)
+        return universalPages(f.load(h), h, pageUrl)[0]
+    }
+    const samples = [...new Set([0, Math.floor(thumbs.length / 2), thumbs.length - 1])]
+    const sampleFull: (string | undefined)[] = []
+    for (const i of samples) {
+        try { sampleFull.push(await fullOf((thumbs[i] as { url: string }).url)) } catch { sampleFull.push(undefined) }
+    }
+    const rule = thumbToFullRule(samples.map(i => (thumbs[i] as { thumb: string }).thumb), sampleFull)
+    if (rule) return thumbs.map(t => rule(t.thumb))
+    // Pas de règle sûre : on ouvre chaque page de lecture
+    const pages = await mapLimitSimple(thumbs, 4, async t => { try { return await fullOf(t.url) } catch { return undefined } })
+    return pages.filter((x): x is string => !!x)
+}
+
+/** Règles connues miniature -> grande image ; retenue seulement si elle reproduit tous les exemples */
+function thumbToFullRule(thumbs: string[], fulls: (string | undefined)[]): ((t: string) => string) | null {
+    const rules: ((t: string) => string)[] = [
+        t => t.replace(/\/\/t(\d*)\./, '//i$1.').replace(/(\d+)t(\.[a-z]+)(\?|$)/i, '$1$2$3'),
+        t => t.replace(/(\d+)t(\.[a-z]+)(\?|$)/i, '$1$2$3'),
+        t => t.replace(/\/thumbs?\//i, '/'),
+        t => t.replace(/[-_.]thumb(nail)?(?=\.[a-z]+(\?|$))/i, ''),
+        t => t.replace(/\/thumb(nail)?s?[-_]/i, '/'),
+        t => t.replace(/\/\/t(\d*)\./, '//i$1.')
+    ]
+    if (fulls.some(x => !x) || thumbs.some(x => !x)) return null
+    for (const r of rules) if (thumbs.every((t, i) => r(t) === fulls[i] && r(t) !== t)) return r
+    return null
+}
+
+async function mapLimitSimple<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+    const out: R[] = new Array(items.length)
+    let next = 0
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (next < items.length) { const i = next++; out[i] = await fn(items[i] as T) }
+    }))
+    return out
+}
+
 export async function universalPagesDeep(f: Fetcher, $: CheerioAPI, html: string, url: string): Promise<string[]> {
     const pages = universalPages($, html, url)
     if (pages.length >= 2) return pages

@@ -20,7 +20,7 @@ import {
     TagSection
 } from '@paperback/types'
 import { CheerioAPI } from 'cheerio'
-import { parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
+import { galleryPages, parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
 import { Details, detectEngine, Engine, engineByName, Fetcher, ListingItem } from './Engines'
 import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
@@ -30,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.5.1',
+    version: '1.6.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -47,11 +47,16 @@ export const TagFusionInfo: SourceInfo = {
 
 /** Où on en est sur chaque site pendant un défilement de résultats */
 interface SearchMeta {
-    sites: Record<string, { page: number, done: boolean, firstUrl?: string, mode?: string }>
+    sites: Record<string, { page: number, done: boolean, firstUrl?: string, mode?: string, cpage?: number, offset?: number }>
     seen: string[]
+    /** Tour de rôle des sites parcourus par leur catalogue */
+    cursor?: number
 }
 
 const DISCOVERY_BUDGET_MS = 10000
+/** Parcours d'un catalogue : fiches lues par site et par tour, et sites parcourus par tour */
+const CRAWL_BATCH = 10
+const CRAWL_SITES_PER_ROUND = 2
 /** Durée maximum d'une action lancée depuis les réglages */
 const SETTINGS_BUDGET_MS = 25000
 
@@ -236,14 +241,15 @@ export class TagFusion extends Source {
      * Les enregistrements sont attendus (et non lancés en arrière-plan) : Paperback peut
      * suspendre l'extension dès qu'elle a répondu, et une écriture pas finie serait perdue.
      */
-    private async fetchDetails(siteId: string, url: string): Promise<Details> {
+    private async fetchDetails(siteId: string, url: string, record = true): Promise<Details> {
         const cached = this.detailsCache.get(url)
         if (cached) return cached
         const engine = await this.engineOf(siteId)
         const base = await this.baseOf(siteId)
         const $ = this.fetcher.load(await this.fetcher.get(url))
         const details = engine.parseDetails($, url, base)
-        try {
+        // Pendant une recherche, l'enregistrement est fait en un seul lot par l'appelant
+        if (record) try {
             const added = await this.store.addTags(siteId, details.tags)
             await this.store.indexManga(encodeMangaId(siteId, url), {
                 s: siteId, u: url, t: details.title || 'Sans titre', i: details.image, l: details.tags.map(t => t.label)
@@ -491,8 +497,17 @@ export class TagFusion extends Source {
         // (un écran vide ferait croire à Paperback que la liste est finie). Limite de temps : 18 s.
         const started = Date.now()
         for (let round = 0; round < 8 && results.length === 0 && Date.now() - started < 18000; round++) {
-            const active = sites.filter(s => !meta.sites[s]?.done)
-            if (active.length === 0) break
+            const pending = sites.filter(s => !meta.sites[s]?.done)
+            if (pending.length === 0) break
+            // Sites avec une page pour le tag : tous à chaque tour (rapide).
+            // Sites à parcourir par catalogue (lent) : 2 au plus par tour, à tour de rôle.
+            const crawl = pending.filter(s => included.length > 0 && included.every(k => !unified[k]?.sites[s]?.url))
+            const fast = pending.filter(s => !crawl.includes(s))
+            const cursor = meta.cursor ?? 0
+            const picked = crawl.length <= CRAWL_SITES_PER_ROUND ? crawl
+                : Array.from({ length: CRAWL_SITES_PER_ROUND }, (_, i) => crawl[(cursor + i) % crawl.length] as string)
+            meta.cursor = cursor + CRAWL_SITES_PER_ROUND
+            const active = [...fast, ...picked]
             const perSite = await Promise.all(active.map(s => this.searchSitePage(s, meta, unified, included, excluded, title)))
             const info = await this.store.getSiteInfo()
             const lists = perSite.map((items, i) => {
@@ -542,7 +557,7 @@ export class TagFusion extends Source {
     private async catalogOf(siteId: string, engine: Engine, base: string): Promise<string> {
         const known = (await this.store.site(siteId))?.catalog
         if (known !== undefined) return known
-        for (const candidate of engine.catalogPages(base)) {
+        for (const candidate of engine.catalogPages(base).slice(0, 4)) {
             try {
                 const items = engine.parseListing(this.fetcher.load(await this.fetcher.get(candidate)), candidate, base)
                 if (items.length >= 4) {
@@ -557,84 +572,102 @@ export class TagFusion extends Source {
     }
 
     /**
-     * Charge la page suivante d'UN site pour cette recherche. Trois façons, de la plus rapide à la plus complète :
+     * Garde les mangas qui ont tous les tags demandés et aucun tag exclu.
+     * Déjà indexés : vérifiés sans requête. Les autres : fiche lue, puis tout est enregistré
+     * en un seul lot (tags du site + index), pour rester rapide et léger.
+     */
+    private async verifyItems(siteId: string, items: ListingItem[], included: string[], excluded: string[]): Promise<ListingItem[]> {
+        const merges = await this.store.customMerges()
+        const newEntries: { id: string, entry: { s: string, u: string, t: string, i: string, l: string[] } }[] = []
+        const newTags: SiteTag[] = []
+        const checks = await mapLimit(items, 4, async item => {
+            try {
+                const id = encodeMangaId(siteId, item.url)
+                const indexed = await this.store.getIndexed(id)
+                let labels: string[]
+                if (indexed) labels = indexed.l
+                else {
+                    const d = await this.fetchDetails(siteId, item.url, false)
+                    labels = d.tags.map(t => t.label)
+                    newTags.push(...d.tags)
+                    newEntries.push({ id, entry: { s: siteId, u: item.url, t: item.title || d.title || 'Sans titre', i: item.image || d.image, l: labels } })
+                }
+                const keys = new Set(labels.map(l => tagKey(l, merges)).filter((k): k is string => k !== null))
+                return included.every(k => keys.has(k)) && !excluded.some(k => keys.has(k))
+            } catch {
+                return false
+            }
+        })
+        try {
+            if (newTags.length) await this.store.addTags(siteId, newTags)
+            if (newEntries.length) await this.store.indexMany(newEntries)
+        } catch { /* l'enregistrement ne doit pas bloquer la recherche */ }
+        return items.filter((_, i) => checks[i])
+    }
+
+    /**
+     * Charge la suite d'UN site pour cette recherche. De la plus rapide à la plus complète :
      *  - le site a une page pour ce(s) tag(s) : on la parcourt (et on vérifie les autres tags s'il y en a) ;
-     *  - sinon on parcourt le catalogue complet du site et on vérifie les tags de chaque manga.
-     *    Les mangas déjà indexés sont vérifiés sans requête ; les autres sont lus puis indexés au passage.
+     *  - sinon on parcourt son catalogue complet, par lots de quelques fiches, en vérifiant les tags.
      */
     private async searchSitePage(
         siteId: string, meta: SearchMeta, unified: Record<string, UnifiedTag>,
         included: string[], excluded: string[], title: string
     ): Promise<ListingItem[]> {
         const state = meta.sites[siteId] ?? (meta.sites[siteId] = { page: 0, done: false })
-        const page = state.page + 1
         try {
             const engine = await this.engineOf(siteId)
             const base = await this.baseOf(siteId)
+            const siteTags = included.map(k => unified[k]?.sites[siteId])
+            const withPage = siteTags.filter((t): t is SiteTag => !!t && !!t.url)
 
+            // --- Parcours du catalogue, par lots ---
+            if (included.length > 0 && withPage.length === 0) {
+                state.mode = 'catalogue'
+                const catalog = await this.catalogOf(siteId, engine, base)
+                if (!catalog) { state.done = true; return [] }
+                const cpage = state.cpage ?? 1
+                const offset = state.offset ?? 0
+                const url = pagedUrl(catalog, cpage)
+                const items = engine.parseListing(this.fetcher.load(await this.fetcher.get(url)), url, base)
+                const first = items[0]?.url
+                if (!first || (cpage > 1 && first === state.firstUrl)) { state.done = true; return [] }
+                if (cpage === 1) state.firstUrl = first
+                let batch = items.slice(offset, offset + CRAWL_BATCH)
+                if (offset + CRAWL_BATCH >= items.length) { state.cpage = cpage + 1; state.offset = 0 } else state.offset = offset + CRAWL_BATCH
+                if (title) batch = batch.filter(i => titleKey(i.title).includes(titleKey(title)))
+                const found = await this.verifyItems(siteId, batch, included, excluded)
+                await this.debug(`recherche ${siteId} : catalogue p.${cpage} (${offset + 1}-${offset + batch.length}), ${found.length} trouvé(s)`)
+                return found
+            }
+
+            // --- Page du tag (ou recherche par titre) ---
+            const page = state.page + 1
             let url: string
             let mustCheckTags = excluded.length > 0
             if (included.length === 0) {
                 url = engine.searchUrl(base, title, page)
                 state.mode = 'titre'
+            } else if (withPage.length === siteTags.length) {
+                const combined = engine.combinedUrl(base, withPage, page)
+                url = combined ?? engine.listingUrl(withPage[0] as SiteTag, page)
+                if (!combined && withPage.length > 1) mustCheckTags = true
+                state.mode = 'page du tag'
             } else {
-                const siteTags = included.map(k => unified[k]?.sites[siteId])
-                const withPage = siteTags.filter((t): t is SiteTag => !!t && !!t.url)
-                if (withPage.length === siteTags.length) {
-                    const combined = engine.combinedUrl(base, withPage, page)
-                    url = combined ?? engine.listingUrl(withPage[0] as SiteTag, page)
-                    if (!combined && withPage.length > 1) mustCheckTags = true
-                    state.mode = 'page du tag'
-                } else if (withPage.length > 0) {
-                    // Un des tags a une page sur ce site : on la parcourt et on vérifie les autres
-                    url = engine.listingUrl(withPage[0] as SiteTag, page)
-                    mustCheckTags = true
-                    state.mode = 'page du tag + vérification'
-                } else {
-                    // Aucun tag n'a de page sur ce site : on parcourt tout son catalogue
-                    const catalog = await this.catalogOf(siteId, engine, base)
-                    if (!catalog) { state.done = true; return [] }
-                    url = pagedUrl(catalog, page)
-                    mustCheckTags = true
-                    state.mode = 'catalogue'
-                }
+                // Un des tags a une page sur ce site : on la parcourt et on vérifie les autres
+                url = engine.listingUrl(withPage[0] as SiteTag, page)
+                mustCheckTags = true
+                state.mode = 'page du tag + vérification'
             }
 
-            const $ = this.fetcher.load(await this.fetcher.get(url))
-            let items = engine.parseListing($, url, base)
+            let items = engine.parseListing(this.fetcher.load(await this.fetcher.get(url)), url, base)
             state.page = page
-
             // Fin de liste : page vide, ou le site renvoie encore la page 1
             const first = items[0]?.url
-            if (!first || (page > 1 && first === state.firstUrl)) {
-                state.done = true
-                return []
-            }
+            if (!first || (page > 1 && first === state.firstUrl)) { state.done = true; return [] }
             if (page === 1) state.firstUrl = first
-
-            if (title && included.length > 0) {
-                const want = titleKey(title)
-                items = items.filter(i => titleKey(i.title).includes(want))
-            }
-
-            if (mustCheckTags) {
-                const merges = await this.store.customMerges()
-                const checks = await mapLimit(items, 4, async item => {
-                    try {
-                        // Déjà indexé : on connaît ses tags sans relire sa fiche
-                        const indexed = await this.store.getIndexed(encodeMangaId(siteId, item.url))
-                        const labels = indexed ? indexed.l : (await this.fetchDetails(siteId, item.url)).tags.map(t => t.label)
-                        const keys = new Set(labels.map(l => tagKey(l, merges)).filter((k): k is string => k !== null))
-                        return included.every(k => keys.has(k)) && !excluded.some(k => keys.has(k))
-                    } catch {
-                        return false
-                    }
-                })
-                const total = items.length
-                items = items.filter((_, i) => checks[i])
-                if (state.mode === 'catalogue') await this.debug(`recherche ${siteId} : catalogue page ${page}, ${items.length}/${total} correspondent`)
-            }
-            return items
+            if (title && included.length > 0) items = items.filter(i => titleKey(i.title).includes(titleKey(title)))
+            return mustCheckTags ? this.verifyItems(siteId, items, included, excluded) : items
         } catch (e) {
             state.done = true
             await this.store.updateSite(siteId, { error: e instanceof Error ? e.message : String(e) })
@@ -784,7 +817,9 @@ export class TagFusion extends Source {
         try {
             const html = await this.fetcher.get(pageUrl)
             const $p = this.fetcher.load(html)
-            let found = engine.parsePages($p, html, pageUrl)
+            // Galerie (miniatures vers des pages de lecture) : images en taille réelle, jamais les miniatures
+            let found = await galleryPages(this.fetcher, $p, pageUrl)
+            if (found.length < 2) found = engine.parsePages($p, html, pageUrl)
             // Vieux lecteurs "une image par page" : on suit les pages du chapitre
             if (found.length < 2) found = await universalPagesDeep(this.fetcher, $p, html, pageUrl)
             pages = [...new Set(found.map(p => safeUrl(p, '')).filter(Boolean))]

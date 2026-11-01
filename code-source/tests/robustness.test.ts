@@ -27,6 +27,14 @@ const betaTags: Record<string, string[]> = {
 }
 for (const [slug, tags] of Object.entries(betaTags)) GET[`https://beta.test/manga/${slug}/`] = details(`Beta ${slug}`, tags)
 
+// --- 6 sites de plus sans page de tag (catalogue seulement) ---
+const CRAWL_SITES = ['c1', 'c2', 'c3', 'c4', 'c5', 'c6']
+for (const c of CRAWL_SITES) {
+    GET[`https://${c}.test/`] = page('<p>x</p>')
+    GET[`https://${c}.test/manga/`] = page([1, 2, 3, 4].map(n => card(`${c}.test`, `${c}m${n}`, `${c.toUpperCase()} Manga ${n}`)).join(''))
+    for (const n of [1, 2, 3, 4]) GET[`https://${c}.test/manga/${c}m${n}/`] = details(`${c} ${n}`, n === 2 ? ['Romance'] : ['Action'])
+}
+
 // --- Fiches pour les tests de chapitres ---
 GET['https://legacy.test/'] = page('<p>x</p>')
 GET['https://legacy.test/manga/old_one/'] = details('Old One', ['Action'], 3)
@@ -36,8 +44,9 @@ GET['https://badpct.test/manga/caf/'] = page('<h1>Café</h1><ul class="chapters"
 // --- Fausse app Paperback ---
 const mem = new Map<string, unknown>()
 const requests: string[] = []
+let indexWrites = 0
 ;(globalThis as any).App = {
-    createSourceStateManager: () => ({ keychain: {}, store: async (k: string, v: unknown) => { mem.set(k, JSON.parse(JSON.stringify(v))) }, retrieve: async (k: string) => mem.get(k) }),
+    createSourceStateManager: () => ({ keychain: {}, store: async (k: string, v: unknown) => { if (k === 'tf_manga_index') indexWrites++; mem.set(k, JSON.parse(JSON.stringify(v))) }, retrieve: async (k: string) => mem.get(k) }),
     createRequestManager: (info: any) => ({
         ...info,
         getDefaultUserAgent: async () => 'UA',
@@ -157,12 +166,36 @@ async function main(): Promise<void> {
     await quiet('bouton Charger les tags', async () => { const menu = await src.getSourceMenu(); const rows = await menu.rows(); await rows.find((r: any) => r.id === 'discover').onTap() })
     console.log('✓ Aucune requête après la réponse à l\'app (recherche, fiche, chapitres, accueil, réglages)')
 
+    // --- Beaucoup de sites sans page de tag : la première page reste rapide et légère ---
+    await src.resetExtension(false)
+    await src.store.setSites(['https://alpha.test', ...CRAWL_SITES.map(c => `https://${c}.test`)])
+    await src.discoverAll(true)
+    requests.length = 0
+    indexWrites = 0
+    let r = await src.getSearchResults({ includedTags: [tag], excludedTags: [] }, undefined)
+    assert.ok(r.results.length > 0, 'la première page affiche des mangas')
+    assert.ok(requests.length <= 30, `première page trop lourde : ${requests.length} requêtes`)
+    assert.ok(indexWrites <= 3, `trop d'écritures de l'index : ${indexWrites}`)
+    console.log(`✓ 7 sites dont 6 sans page de tag : 1re page en ${requests.length} requêtes, ${indexWrites} écriture(s) de l'index, ${r.results.length} manga(s)`)
+    const all: string[] = r.results.map((m: any) => m.title)
+    let meta2 = r.metadata
+    let guard = 0
+    while (meta2 !== undefined && guard++ < 30) {
+        r = await src.getSearchResults({ includedTags: [tag], excludedTags: [] }, meta2)
+        assert.ok(r.results.length > 0 || r.metadata === undefined, 'jamais de page vide tant que la liste continue')
+        all.push(...r.results.map((m: any) => m.title))
+        meta2 = r.metadata
+    }
+    const wanted = ['Alpha One', 'Alpha Two', 'Alpha Three', 'Alpha Four', ...CRAWL_SITES.map(c => `${c.toUpperCase()} Manga 2`)]
+    assert.deepEqual([...all].sort(), [...wanted].sort())
+    console.log(`✓ En faisant défiler : les ${wanted.length} mangas Romance des 7 sites, sans doublon`)
+
     // --- Réinitialisation partielle : index et tags effacés, sites gardés ---
     assert.ok(await src.store.indexSize() > 0)
     await src.resetExtension(false)
     assert.equal(await src.store.indexSize(), 0)
     assert.equal(Object.keys(await src.store.unified()).length, 0)
-    assert.equal((await src.store.getSites()).length, 4)
+    assert.equal((await src.store.getSites()).length, 7)
     console.log('✓ « Effacer l\'index et les tags » : index vide, tags vides, sites conservés')
 
     // --- Réinitialisation complète ---

@@ -217,12 +217,25 @@ export class Store {
 
     /** Enregistre (ou met à jour) un manga et tous ses tags. Retourne true si ses tags ont changé. */
     async indexManga(mangaId: string, entry: Omit<IndexedManga, 'at'>): Promise<boolean> {
-        const labels = [...new Set(entry.l.map(cleanTagLabel).filter(l => tagKey(l) !== null))]
+        return (await this.indexMany([{ id: mangaId, entry }])) > 0
+    }
+
+    /**
+     * Enregistre plusieurs mangas en UNE seule écriture (l'index peut être gros : l'écrire
+     * à chaque fiche serait lent et lourd en mémoire). Retourne le nombre de mangas modifiés.
+     */
+    async indexMany(list: { id: string, entry: Omit<IndexedManga, 'at'> }[]): Promise<number> {
+        if (list.length === 0) return 0
         return this.serial(async () => {
             const index = await this.getIndex(true)
-            const prev = index[mangaId]
-            const changed = !prev || prev.l.join('|') !== labels.join('|')
-            index[mangaId] = { s: entry.s, u: entry.u, t: entry.t.slice(0, 200), i: entry.i, l: labels, at: Date.now() }
+            let changed = 0
+            const now = Date.now()
+            for (const { id, entry } of list) {
+                const labels = [...new Set(entry.l.map(cleanTagLabel).filter(l => tagKey(l) !== null))]
+                const prev = index[id]
+                if (!prev || prev.l.join('|') !== labels.join('|')) changed++
+                index[id] = { s: entry.s, u: entry.u, t: entry.t.slice(0, 200), i: entry.i, l: labels, at: now }
+            }
             const ids = Object.keys(index)
             if (ids.length > INDEX_LIMIT) {
                 ids.sort((a, b) => (index[a]?.at ?? 0) - (index[b]?.at ?? 0))

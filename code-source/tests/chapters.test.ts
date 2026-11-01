@@ -104,6 +104,24 @@ GET['https://grid.test/manga/num/1'] = page('<div class="reader"><img src="/scan
 GET['https://grid.test/manga/num/1/2'] = page('<div class="reader"><img src="/scan/num1-p2.jpg"></div>')
 GET['https://grid.test/manga/num/1/3'] = page('<div class="reader"><img src="/scan/num1-p3.jpg"></div>')
 
+
+// 20. Galerie type nhentai : miniatures -> pages de lecture -> grande image (règle déductible)
+GET['https://gal.test/'] = page(generic)
+GET['https://gal.test/g/692926/'] = page(`<h1>Galerie</h1><section id="tags"><a href="/tag/romance/">Romance</a></section>
+<div class="thumbs">${[1, 2, 3, 4, 5].map(n => `<div class="thumb-container"><a class="gallerythumb" href="/g/692926/${n}/"><img class="lazyload" data-src="https://t3.gal.test/galleries/3713001/${n}t.webp" src="data:image/gif;base64,xx" width="200" height="280"></a></div>`).join('')}</div>
+<div id="related-container"><div class="gallery"><a href="/g/111/" class="cover"><img data-src="https://t3.gal.test/galleries/999/thumb.jpg"></a></div><div class="gallery"><a href="/g/222/" class="cover"><img data-src="https://t3.gal.test/galleries/888/thumb.jpg"></a></div></div>`)
+for (const n of [1, 2, 3, 4, 5]) GET[`https://gal.test/g/692926/${n}/`] = page(`<nav><img src="/img/logo.svg"></nav><section id="image-container"><a href="/g/692926/${n + 1}/"><img src="https://i3.gal.test/galleries/3713001/${n}.webp" width="1280" height="1810"></a></section>`)
+
+// 21. Galerie sans règle déductible (noms de miniatures sans rapport) : chaque page de lecture est ouverte
+GET['https://gal2.test/'] = page(generic)
+GET['https://gal2.test/album/77/'] = page(`<h1>Album</h1><div class="thumbs">${[1, 2, 3].map(n => `<a href="/album/77/${n}/"><img src="https://cdn.gal2.test/mini/${'abc'[n - 1]}x.jpg"></a>`).join('')}</div>`)
+for (const n of [1, 2, 3]) GET[`https://gal2.test/album/77/${n}/`] = page(`<div class="viewer"><img src="https://img.gal2.test/full/77/${n}-hd.jpg"></div>`)
+
+// 22. Type Hentai2Read : chapitres "/titre/N/" avec texte "N - Titre", images en chemins relatifs servies par un autre serveur
+GET['https://h2r.test/'] = page(generic)
+GET['https://h2r.test/office-love/'] = page('<h1>Office Love</h1><ul class="nav-chapters"><li><div class="media"><a class="pull-left" href="https://h2r.test/office-love/2/">2 - Weekend</a></div></li><li><div class="media"><a class="pull-left" href="https://h2r.test/office-love/1/">1 - Monday</a></div></li></ul><div class="related"><a href="https://h2r.test/other/">Other</a></div>')
+GET['https://h2r.test/office-love/1/'] = page('<div class="reader"><img id="arf-reader" src="https://static.cdn-h2r.test/hentai/office/1/001.jpg"></div><script>var gData = {"mainURL":"https:\\/\\/h2r.test\\/office-love\\/","images":["\\/office\\/1\\/001.jpg","\\/office\\/1\\/002.jpg","\\/office\\/1\\/003.jpg"]};</script>')
+
 // --- Fausse app Paperback ---
 const mem = new Map<string, unknown>()
 const requests: string[] = []
@@ -127,7 +145,7 @@ async function main(): Promise<void> {
     const { TagFusion } = await import('../src/TagFusion/TagFusion')
     const { encodeMangaId, decodeChapterId } = await import('../src/TagFusion/Utils')
     const src: any = new TagFusion({ load })
-    const sites = ['madara-ajax', 'themesia', 'slug', 'readid', 'separate', 'select', 'next', 'vol', 'nonum', 'madara', 'datahref', 'grid', 'rsc', 'ajaxattr', 'bookid', 'jsonapi', 'asc', 'empty'].map(s => `https://${s}.test`)
+    const sites = ['madara-ajax', 'themesia', 'slug', 'readid', 'separate', 'select', 'next', 'vol', 'nonum', 'madara', 'datahref', 'grid', 'rsc', 'ajaxattr', 'bookid', 'jsonapi', 'asc', 'empty', 'gal', 'gal2', 'h2r'].map(s => `https://${s}.test`)
     await src.store.setSites(sites)
 
     const chaptersOf = async (site: string, path: string): Promise<any[]> => src.getChapters(encodeMangaId(site, `https://${site}${path}`))
@@ -200,6 +218,13 @@ async function main(): Promise<void> {
     c = await chaptersOf('asc.test', '/manga/up/'); check(c)
     assert.deepEqual(nums(c), [3, 2, 1]); console.log('✓ 17. Liste du plus ancien au plus récent : remise dans le bon ordre')
 
+
+    c = await chaptersOf('gal.test', '/g/692926/'); check(c)
+    assert.equal(c.length, 1); assert.equal(paths(c)[0], '/g/692926/'); console.log('✓ 20. Galerie sans chapitres (type nhentai) : un chapitre unique, galeries « similaires » ignorées')
+
+    c = await chaptersOf('h2r.test', '/office-love/'); check(c)
+    assert.deepEqual(c.map(x => [x.chapNum, x.name]), [[2, 'Weekend'], [1, 'Monday']]); console.log('✓ 22. Chapitres « /titre/N/ » (type Hentai2Read) : 2 chapitres, titres propres')
+
     requests.length = 0
     c = await chaptersOf('empty.test', '/manga/void/')
     assert.deepEqual(c, []); assert.ok(requests.length <= 8, `trop de requêtes : ${requests.length}`)
@@ -230,5 +255,17 @@ async function main(): Promise<void> {
     console.log('✓ Pages : liste codée en base64')
     assert.deepEqual(await pagesOf('grid.test', '/manga/num/', '/manga/num/1'), [1, 2, 3].map(n => `https://grid.test/scan/num1-p${n}.jpg`))
     console.log('✓ Pages : vieux lecteur « une image par page » (3 pages suivies)')
+
+    requests.length = 0
+    const galPages = await pagesOf('gal.test', '/g/692926/', '/g/692926/')
+    assert.deepEqual(galPages, [1, 2, 3, 4, 5].map(n => `https://i3.gal.test/galleries/3713001/${n}.webp`))
+    assert.ok(!galPages.some(u => u.includes('t.webp')), 'jamais les miniatures')
+    assert.ok(requests.length <= 4, `trop de requêtes : ${requests.length}`)
+    console.log(`✓ Pages : galerie en taille réelle (règle vérifiée sur 3 pages, ${requests.length} requêtes pour 5 pages)`)
+    c = await chaptersOf('gal2.test', '/album/77/'); assert.equal(c.length, 1)
+    assert.deepEqual(await pagesOf('gal2.test', '/album/77/', '/album/77/'), [1, 2, 3].map(n => `https://img.gal2.test/full/77/${n}-hd.jpg`))
+    console.log('✓ Pages : galerie sans règle déductible, chaque page de lecture ouverte, dans l\'ordre')
+    assert.deepEqual(await pagesOf('h2r.test', '/office-love/', '/office-love/1/'), [1, 2, 3].map(n => `https://static.cdn-h2r.test/hentai/office/1/00${n}.jpg`))
+    console.log('✓ Pages : chemins relatifs servis par un autre serveur (type Hentai2Read), serveur retrouvé')
 }
 main().then(() => console.log('\nChapitres et pages : tout est bon')).catch(e => { console.error('ÉCHEC :', e); process.exit(1) })
