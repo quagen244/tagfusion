@@ -1,7 +1,7 @@
 import { CheerioAPI, Cheerio, Element } from 'cheerio'
 import { EngineName, SiteTag } from './Store'
 import {
-    absoluteUrl, hostOf, looksLikeChapterUrl, looksLikeMangaUrl, looksLikeTagUrl,
+    absoluteUrl, hostOf, looksLikeChapterUrl, looksLikeMangaUrl, looksLikeTagUrl, normalizeTagText,
     pagedUrl, parseChapterNumber, parseDate, pickImageSrc
 } from './Utils'
 
@@ -95,6 +95,75 @@ function genericTagLinks($: CheerioAPI, base: string, skipNav: boolean, scope?: 
     return out
 }
 
+/** Une classe ou un id qui désigne une zone de tags : "tags", "genres-content", "manga-tag-list", "categories"... */
+const TAG_TOKEN = /(^|[-_])(tags?|taglist|genres?|genre-list|categor(?:y|ies)|keywords?|themes?)($|[-_])/i
+const TAG_TOKEN_EXCLUDE = /(tagline|stage|vintage|heritage|advantage|nav|menu|widget|footer|header|sidebar|search|filter|form|select|cloud)/i
+
+function isTagZone(el: Element): boolean {
+    if (el.attribs['itemprop'] === 'genre') return true
+    const tokens = `${el.attribs['class'] ?? ''} ${el.attribs['id'] ?? ''}`.split(/\s+/).filter(Boolean)
+    return tokens.some(t => TAG_TOKEN.test(t) && !TAG_TOKEN_EXCLUDE.test(t))
+}
+
+/**
+ * Tous les tags visibles sur une fiche, qu'ils soient des liens ou de simples étiquettes.
+ * Un tag sans page dédiée sur le site reçoit url = '' : il ne sert qu'à l'index des mangas.
+ */
+function zoneTags($: CheerioAPI, pageUrl: string, base: string): SiteTag[] {
+    const out: SiteTag[] = []
+    const seen = new Set<string>()
+    const push = (rawLabel: string, href?: string): void => {
+        const label = clean(rawLabel).replace(/^#/, '').replace(/\s*[([]?\d[\d,.\s]*[)\]]?\s*$/, '').replace(/[,;|•·]+$/, '').trim()
+        if (!label || label.length > 40 || /:$/.test(label)) return
+        const norm = normalizeTagText(label)
+        if (!norm || seen.has(norm)) return
+        seen.add(norm)
+        const url = absoluteUrl(href, pageUrl)
+        out.push({ label, url: url && sameHost(url, base) && looksLikeTagUrl(url) ? url.replace(/#.*$/, '') : '' })
+    }
+    $('[class], [id], a[rel="tag"]').each((_, el) => {
+        if (el.name === 'a' && el.attribs['rel'] === 'tag') { push($(el).text(), $(el).attr('href')); return }
+        if (!isTagZone(el) || inNav($, el)) return
+        const zone = $(el)
+        // Une zone de tags est courte : on ignore les grands blocs qui ont juste un nom trompeur
+        if (clean(zone.text()).length > 1500) return
+        let chips = 0
+        // Si la zone est elle-même un tag (lien ou étiquette seule)
+        if (zone.find('a, li, span, button').length === 0) {
+            const text = clean(zone.text())
+            if (el.name === 'a') { push(text, zone.attr('href')); return }
+            // "Action, Romance, Drame" en texte brut
+            for (const part of text.replace(/^[^:]{1,20}:\s*/, '').split(/\s*[,;|•·/]\s*/)) push(part)
+            return
+        }
+        zone.find('a, li, span, button').each((_, c) => {
+            const chip = $(c)
+            // On ne garde que les "feuilles" (pas les éléments qui contiennent d'autres étiquettes)
+            if (chip.find('a, li, span, button').length > 0) return
+            chips++
+            push(chip.text(), c.name === 'a' ? chip.attr('href') : undefined)
+        })
+        if (chips === 0) for (const part of clean(zone.text()).split(/\s*[,;|•·]\s*/)) push(part)
+    })
+    return out
+}
+
+/** Réunit deux listes de tags sans doublon (on garde la version qui a une page et un filtre) */
+function mergeTags(a: SiteTag[], b: SiteTag[]): SiteTag[] {
+    const byKey = new Map<string, SiteTag>()
+    for (const t of [...a, ...b]) {
+        const k = normalizeTagText(t.label)
+        if (!k) continue
+        const prev = byKey.get(k)
+        if (!prev) byKey.set(k, { ...t })
+        else {
+            if (!prev.url && t.url) prev.url = t.url
+            if (!prev.filter && t.filter) prev.filter = t.filter
+        }
+    }
+    return [...byKey.values()]
+}
+
 /** Liste de mangas : liens vers des fiches, accompagnés d'une image */
 function genericListing($: CheerioAPI, pageUrl: string, base: string): ListingItem[] {
     const byUrl = new Map<string, ListingItem>()
@@ -144,7 +213,7 @@ function genericDetails($: CheerioAPI, url: string, base: string): Details {
     if (!desc) desc = og('og:description') || clean($('meta[name="description"]').attr('content'))
     return {
         title, image, desc, author: '', artist: '', status: 'Unknown', altTitles: [],
-        tags: genericTagLinks($, base, true)
+        tags: mergeTags(genericTagLinks($, base, true), zoneTags($, url, base))
     }
 }
 
@@ -300,7 +369,7 @@ export const MadaraEngine: Engine = {
             artist: clean($('.artist-content a').map((_, el) => $(el).text()).get().join(', ')) || info(/artist|artiste/i),
             status: info(/status|statut|estado/i) || 'Unknown',
             altTitles: info(/altern|other name|autres? noms?/i).split(/[,;/]/).map(clean).filter(Boolean),
-            tags: MadaraEngine.parseTags($, url, base, true)
+            tags: mergeTags(MadaraEngine.parseTags($, url, base, true), zoneTags($, url, base))
         }
     },
     getChapters: async (f, mangaUrl, $, base) => {
@@ -407,7 +476,7 @@ export const ThemesiaEngine: Engine = {
             artist: field(/artist|artiste/i),
             status: field(/status|statut|estado/i) || 'Unknown',
             altTitles: clean($('.alternative, .seriestualt').first().text()).split(/[,;/]/).map(clean).filter(Boolean),
-            tags: ThemesiaEngine.parseTags($, url, base, true)
+            tags: mergeTags(ThemesiaEngine.parseTags($, url, base, true), zoneTags($, url, base))
         }
     },
     getChapters: async (_f, mangaUrl, $, base) => {

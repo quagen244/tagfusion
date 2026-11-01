@@ -29,7 +29,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.1.0',
+    version: '1.2.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -130,10 +130,9 @@ export class TagFusion extends Source {
         const host = hostOf(url)
         if ((response.status === 403 || response.status === 503) &&
             (/cf-chl|challenge-platform|just a moment|cf_clearance/i.test(html) || /cloudflare/i.test(String(response.headers?.['server'] ?? response.headers?.['Server'] ?? '')))) {
-            const blocked = await this.store.getCloudflareBlocked()
             const base = (await this.store.getSiteInfo())[host]?.base ?? (/^https?:\/\/[^/]+/i.exec(url) ?? [url])[0]
             await this.store.markCloudflareBlocked(base)
-            const n = blocked.length
+            const n = (await this.store.getCloudflareBlocked()).length
             throw new Error(`Cloudflare bloque ${host}. Ouvre la page d'accueil de TagFusion, touche l'icône nuage ☁️ en haut, attends que le site s'affiche, puis reviens.${n > 1 ? ` ${n} sites sont à débloquer : refais-le pour chacun.` : ''}`)
         }
         if (response.status >= 400) throw new Error(`${host} a répondu ${response.status}`)
@@ -227,7 +226,13 @@ export class TagFusion extends Source {
         await this.importRepos()
     }
 
-    /** Lit une fiche, et en profite pour apprendre ses tags */
+    /**
+     * Lit une fiche, et en profite pour apprendre ses tags :
+     *  - les tags qui sont des liens deviennent des tags de recherche du site ;
+     *  - TOUS les tags (liens ou non) vont dans l'index des mangas.
+     * Les enregistrements sont attendus (et non lancés en arrière-plan) : Paperback peut
+     * suspendre l'extension dès qu'elle a répondu, et une écriture pas finie serait perdue.
+     */
     private async fetchDetails(siteId: string, url: string): Promise<Details> {
         const cached = this.detailsCache.get(url)
         if (cached) return cached
@@ -235,7 +240,15 @@ export class TagFusion extends Source {
         const base = await this.baseOf(siteId)
         const $ = this.fetcher.load(await this.fetcher.get(url))
         const details = engine.parseDetails($, url, base)
-        this.store.addTags(siteId, details.tags).catch(() => undefined)
+        try {
+            const added = await this.store.addTags(siteId, details.tags)
+            await this.store.indexManga(encodeMangaId(siteId, url), {
+                s: siteId, u: url, t: details.title || 'Sans titre', i: details.image, l: details.tags.map(t => t.label)
+            })
+            await this.debug(`fiche « ${(details.title || '?').slice(0, 40)} » : ${details.tags.length} tag(s) lu(s), ${added} nouveau(x) tag(s) de recherche`)
+        } catch (e) {
+            await this.debug(`fiche : enregistrement des tags impossible (${e instanceof Error ? e.message : String(e)})`)
+        }
         this.detailsCache.set(url, details)
         if (this.detailsCache.size > 300) {
             const oldest = this.detailsCache.keys().next().value
@@ -443,6 +456,29 @@ export class TagFusion extends Source {
         const seen = new Set(meta.seen)
         const results: PartialSourceManga[] = []
         const ids = new Set<string>()
+
+        // Première page : d'abord les mangas de l'index qui ont ces tags (y compris les tags
+        // qui ne sont pas des liens sur le site, donc introuvables autrement)
+        if (!isSearchMeta(metadata) && included.length > 0) {
+            const info = await this.store.getSiteInfo()
+            let local = await this.store.searchIndex(included, excluded, sites)
+            if (title) local = local.filter(m => titleKey(m.t).includes(titleKey(title)))
+            for (const m of local.slice(0, 100)) {
+                const tk = titleKey(m.t)
+                const dedupe = tk.length >= 3 ? 't' + tk : 'i' + m.id
+                if (ids.has(m.id) || seen.has(dedupe)) continue
+                ids.add(m.id)
+                seen.add(dedupe)
+                seen.add('i' + m.id)
+                results.push(App.createPartialSourceManga({
+                    mangaId: m.id,
+                    title: m.t || 'Sans titre',
+                    image: safeUrl(m.i),
+                    subtitle: (info[m.s]?.name || m.s).slice(0, 60)
+                }))
+            }
+            await this.debug(`recherche : ${results.length} manga(s) trouvé(s) dans l'index`)
+        }
 
         // On boucle tant qu'on n'a rien à montrer mais qu'il reste des pages quelque part
         for (let round = 0; round < 3 && results.length === 0; round++) {

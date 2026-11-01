@@ -141,6 +141,6 @@ async function statusText(store: Store): Promise<string> {
         lines.push(`\n☁️ Bloqués par Cloudflare : ${blocked.map(siteIdOf).join(', ')}`)
         lines.push('Pour débloquer : ouvre la page d\'accueil de TagFusion, touche l\'icône nuage en haut, attends que le site s\'affiche, puis reviens. Recommence pour chaque site.')
     }
-    lines.push(`\nTotal : ${Object.keys(unified).length} tags fusionnés.`)
+    lines.push(`\nTotal : ${Object.keys(unified).length} tags fusionnés, ${await store.indexSize()} manga(s) indexé(s).`)
     return lines.join('\n')
 }
