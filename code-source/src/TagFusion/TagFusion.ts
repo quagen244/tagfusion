@@ -20,6 +20,7 @@ import {
     TagSection
 } from '@paperback/types'
 import { CheerioAPI } from 'cheerio'
+import { parseChapterInfo } from './Chapters'
 import { Details, detectEngine, Engine, engineByName, Fetcher, ListingItem } from './Engines'
 import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
@@ -29,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.2.2',
+    version: '1.3.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -648,13 +649,28 @@ export class TagFusion extends Source {
             await this.debug(`chapitres ${siteId} (${engine.name}) : erreur ${e instanceof Error ? e.message : String(e)}`)
             throw e
         }
-        return chapters.map((c, i) => App.createChapter({
-            id: encodeChapterId(c.url),
-            chapNum: c.num >= 0 ? safeNumber(c.num) : 0,
-            name: c.name || `Chapitre ${chapters.length - i}`,
-            time: safeDate(c.date),
-            sortingIndex: -i
-        }))
+        // Affichage propre dans Paperback : numéro, volume, titre sans "Chapter 12" répété,
+        // numéro de secours si le site n'en donne pas, et aucun identifiant en double
+        const seenIds = new Set<string>()
+        const out: Chapter[] = []
+        const infos = chapters.map(c => parseChapterInfo(c.name, c.url))
+        const nums = fillMissingNumbers(chapters.map((c, i) => c.num >= 0 ? c.num : (infos[i]?.num ?? -1)), chapters.map(c => c.name))
+        chapters.forEach((c, i) => {
+            const id = encodeChapterId(c.url)
+            if (seenIds.has(id)) return
+            seenIds.add(id)
+            const info = infos[i] ?? { num: -1, volume: 0, name: '' }
+            const num = nums[i] ?? 0
+            out.push(App.createChapter({
+                id,
+                chapNum: safeNumber(num),
+                volume: safeNumber(c.volume || info.volume),
+                name: info.name.slice(0, 120),
+                time: safeDate(c.date),
+                sortingIndex: -i
+            }))
+        })
+        return out
     }
 
     override async getChapterDetails(mangaId: string, chapterId: string): Promise<ChapterDetails> {
@@ -684,6 +700,27 @@ export class TagFusion extends Source {
             return 'https://paperback.moe'
         }
     }
+}
+
+/**
+ * Donne un numéro logique aux chapitres qui n'en ont pas (liste du plus récent au plus ancien) :
+ * prologue = 0, sinon à mi-chemin entre ses voisins, ou juste après le plus récent.
+ */
+export function fillMissingNumbers(nums: number[], names: string[]): number[] {
+    const out = [...nums]
+    for (let i = 0; i < out.length; i++) {
+        if ((out[i] ?? -1) >= 0) continue
+        if (/(prologue|prolog|prólogo|prologo|序章|oneshot|one-shot)/i.test(names[i] ?? '')) { out[i] = 0; continue }
+        let newer = -1
+        for (let j = i - 1; j >= 0; j--) if ((nums[j] ?? -1) >= 0) { newer = nums[j] as number; break }
+        let older = -1
+        for (let j = i + 1; j < out.length; j++) if ((nums[j] ?? -1) >= 0) { older = nums[j] as number; break }
+        if (newer >= 0 && older >= 0) out[i] = Math.round(((newer + older) / 2) * 100) / 100
+        else if (older >= 0) out[i] = older + 0.5
+        else if (newer >= 0) out[i] = Math.max(0, newer - 0.5)
+        else out[i] = out.length - i
+    }
+    return out
 }
 
 function isSearchMeta(v: unknown): v is SearchMeta {

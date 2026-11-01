@@ -1,5 +1,6 @@
 import { CheerioAPI, Cheerio, Element } from 'cheerio'
 import { EngineName, SiteTag } from './Store'
+import { sortNewestFirst, universalChapters, universalPages } from './Chapters'
 import {
     absoluteUrl, cleanTagLabel, hostOf, looksLikeChapterUrl, looksLikeMangaUrl, looksLikeTagUrl, normalizeTagText,
     pagedUrl, parseChapterNumber, parseDate, pickImageSrc
@@ -25,7 +26,7 @@ export interface Details {
     tags: SiteTag[]
 }
 
-export interface ChapterItem { url: string, name: string, num: number, date: Date }
+export interface ChapterItem { url: string, name: string, num: number, date: Date, volume?: number }
 
 /** Accès réseau fourni par l'extension */
 export interface Fetcher {
@@ -219,65 +220,6 @@ function genericDetails($: CheerioAPI, url: string, base: string): Details {
     }
 }
 
-function genericChapters($: CheerioAPI, mangaUrl: string, base: string): ChapterItem[] {
-    const out: ChapterItem[] = []
-    const seen = new Set<string>()
-    const mangaPath = mangaUrl.replace(/^https?:\/\/[^/]+/, '').replace(/\/$/, '')
-    $('a[href]').each((_, el) => {
-        if (inNav($, el)) return
-        const url = absoluteUrl($(el).attr('href'), mangaUrl)
-        if (!url || !sameHost(url, base) || !looksLikeChapterUrl(url)) return
-        const u = url.replace(/#.*$/, '')
-        // On garde en priorité les chapitres "sous" la fiche du manga
-        if (seen.has(u)) return
-        seen.add(u)
-        const row = $(el).closest('li, tr, .chapter, [class*="chapter"], div')
-        const name = clean($(el).attr('title')) || clean($(el).text()) || clean(row.text())
-        const dateText = clean(row.find('[class*="date"], [class*="time"], time').first().text())
-        out.push({ url: u, name, num: parseChapterNumber(name, u), date: parseDate(dateText) })
-    })
-    const under = out.filter(c => mangaPath.length > 1 && c.url.includes(mangaPath))
-    return under.length ? under : out
-}
-
-function imagesFromScripts(html: string): string[] {
-    // Beaucoup de lecteurs mettent la liste des pages dans un tableau JSON
-    const re = /\[\s*"(https?:\\?\/\\?\/[^"]+?\.(?:jpe?g|png|webp|gif|avif)[^"]*)"(?:\s*,\s*"https?:[^"]+")+\s*\]/gi
-    let best: string[] = []
-    for (const m of html.matchAll(re)) {
-        try {
-            const arr = JSON.parse(m[0].replace(/\\\//g, '/')) as unknown
-            if (Array.isArray(arr) && arr.length > best.length) best = arr.filter((x): x is string => typeof x === 'string')
-        } catch { /* pas du JSON valide, on ignore */ }
-    }
-    return best
-}
-
-function genericPages($: CheerioAPI, html: string, url: string): string[] {
-    const groups = new Map<unknown, string[]>()
-    $('img').each((_, el) => {
-        if (inNav($, el)) return
-        const src = absoluteUrl(pickImageSrc(el.attribs), url)
-        if (!src || /(logo|icon|avatar|banner|sprite|loading|spinner|emoji|\.svg)/i.test(src)) return
-        const container = $(el).closest('div, section, article, main').get(0)
-        if (!container) return
-        const list = groups.get(container) ?? []
-        if (!list.includes(src)) list.push(src)
-        groups.set(container, list)
-    })
-    let best: string[] = []
-    for (const list of groups.values()) if (list.length > best.length) best = list
-    const fromJs = imagesFromScripts(html)
-    return fromJs.length > best.length ? fromJs : best
-}
-
-function sortNewestFirst(chs: ChapterItem[]): ChapterItem[] {
-    const first = chs[0]
-    const last = chs[chs.length - 1]
-    if (first && last && first.num >= 0 && last.num >= 0 && first.num < last.num) return [...chs].reverse()
-    return chs
-}
-
 // --- Moteur universel -----------------------------------------------------------
 
 export const GenericEngine: Engine = {
@@ -290,9 +232,9 @@ export const GenericEngine: Engine = {
     searchUrl: (base, title, page) => pagedUrl(`${base}/?s=${encodeURIComponent(title)}`, page),
     parseListing: genericListing,
     parseDetails: genericDetails,
-    getChapters: async (_f, mangaUrl, $, base) => sortNewestFirst(genericChapters($, mangaUrl, base)),
+    getChapters: (f, mangaUrl, $, base) => universalChapters(f, mangaUrl, $, base),
     chapterPageUrl: u => u,
-    parsePages: genericPages
+    parsePages: universalPages
 }
 
 // --- Madara (WordPress "WP-Manga") ------------------------------------------------
@@ -406,7 +348,7 @@ export const MadaraEngine: Engine = {
                 } catch { chs = [] }
             }
         }
-        return sortNewestFirst(chs.length ? chs : genericChapters($, mangaUrl, base))
+        return chs.length ? sortNewestFirst(chs) : universalChapters(f, mangaUrl, $, base)
     },
     chapterPageUrl: u => u.includes('?') ? u : u.replace(/\/?$/, '/') + '?style=list',
     parsePages: ($, html, url) => {
@@ -415,7 +357,7 @@ export const MadaraEngine: Engine = {
             const src = absoluteUrl(pickImageSrc(el.attribs), url)
             if (src && !pages.includes(src)) pages.push(src)
         })
-        return pages.length ? pages : genericPages($, html, url)
+        return pages.length ? pages : universalPages($, html, url)
     }
 }
 
@@ -481,7 +423,7 @@ export const ThemesiaEngine: Engine = {
             tags: mergeTags(ThemesiaEngine.parseTags($, url, base, true), zoneTags($, url, base))
         }
     },
-    getChapters: async (_f, mangaUrl, $, base) => {
+    getChapters: async (f, mangaUrl, $, base) => {
         const out: ChapterItem[] = []
         $('#chapterlist li, .eplister li, .clstyle li').each((_, el) => {
             const a = $(el).find('a').first()
@@ -495,7 +437,7 @@ export const ThemesiaEngine: Engine = {
                 date: parseDate(clean($(el).find('.chapterdate').text()))
             })
         })
-        return sortNewestFirst(out.length ? out : genericChapters($, mangaUrl, base))
+        return out.length ? sortNewestFirst(out) : universalChapters(f, mangaUrl, $, base)
     },
     chapterPageUrl: u => u,
     parsePages: ($, html, url) => {
@@ -512,7 +454,7 @@ export const ThemesiaEngine: Engine = {
             const src = absoluteUrl(pickImageSrc(el.attribs), url)
             if (src && !pages.includes(src)) pages.push(src)
         })
-        return pages.length ? pages : genericPages($, html, url)
+        return pages.length ? pages : universalPages($, html, url)
     }
 }
 
