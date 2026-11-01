@@ -29,7 +29,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.2.1',
+    version: '1.2.2',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -639,8 +639,15 @@ export class TagFusion extends Source {
         const base = await this.baseOf(siteId)
         const url = base + path
         const engine = await this.engineOf(siteId)
-        const $ = this.fetcher.load(await this.fetcher.get(url))
-        const chapters = await engine.getChapters(this.fetcher, url, $, base)
+        let chapters: Awaited<ReturnType<Engine['getChapters']>> = []
+        try {
+            const $ = this.fetcher.load(await this.fetcher.get(url))
+            chapters = await engine.getChapters(this.fetcher, url, $, base)
+            await this.debug(`chapitres ${siteId} (${engine.name}) : ${chapters.length} trouvé(s) sur ${path.slice(0, 60)}`)
+        } catch (e) {
+            await this.debug(`chapitres ${siteId} (${engine.name}) : erreur ${e instanceof Error ? e.message : String(e)}`)
+            throw e
+        }
         return chapters.map((c, i) => App.createChapter({
             id: encodeChapterId(c.url),
             chapNum: c.num >= 0 ? safeNumber(c.num) : 0,
@@ -655,8 +662,15 @@ export class TagFusion extends Source {
         const base = await this.baseOf(siteId)
         const engine = await this.engineOf(siteId)
         const pageUrl = engine.chapterPageUrl(base + decodeChapterId(chapterId))
-        const html = await this.fetcher.get(pageUrl)
-        const pages = engine.parsePages(this.fetcher.load(html), html, pageUrl).map(p => safeUrl(p, '')).filter(Boolean)
+        let pages: string[] = []
+        try {
+            const html = await this.fetcher.get(pageUrl)
+            pages = engine.parsePages(this.fetcher.load(html), html, pageUrl).map(p => safeUrl(p, '')).filter(Boolean)
+            await this.debug(`pages ${siteId} (${engine.name}) : ${pages.length} image(s)${pages[0] ? `, ex. ${pages[0].slice(0, 70)}` : ''}`)
+        } catch (e) {
+            await this.debug(`pages ${siteId} (${engine.name}) : erreur ${e instanceof Error ? e.message : String(e)}`)
+            throw e
+        }
         // Les images sont souvent sur un autre serveur qui exige le site comme Referer
         for (const p of pages) this.imageReferers.set(hostOf(p), `${base}/`)
         return App.createChapterDetails({ id: chapterId, mangaId, pages })
