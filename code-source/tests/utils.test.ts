@@ -150,3 +150,15 @@ async function storeTests(): Promise<void> {
     console.log('✓ Registre de tags')
 }
 storeTests().catch(e => { console.error(e); process.exit(1) })
+
+// --- URLs d'images sûres --------------------------------------------------------
+import { safeUrl, FALLBACK_IMAGE } from '../src/TagFusion/Utils'
+assert.equal(safeUrl(''), FALLBACK_IMAGE)
+assert.equal(safeUrl(undefined), FALLBACK_IMAGE)
+assert.equal(safeUrl('/relative.jpg'), FALLBACK_IMAGE)
+assert.equal(safeUrl('//cdn.s.com/a.jpg'), 'https://cdn.s.com/a.jpg')
+assert.equal(safeUrl('https://s.com/my cover é.jpg'), 'https://s.com/my%20cover%20%C3%A9.jpg')
+assert.equal(safeUrl('https://s.com/a%20b.jpg'), 'https://s.com/a%20b.jpg')
+assert.equal(safeUrl('https://s.com/100%.jpg'), 'https://s.com/100%25.jpg')
+assert.equal(safeUrl('https://s.com/a|b.jpg'), 'https://s.com/a%7Cb.jpg')
+console.log('✓ URLs d\'images sûres')

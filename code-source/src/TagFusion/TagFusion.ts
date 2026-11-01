@@ -23,11 +23,11 @@ import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
 import {
     decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
-    mapLimit, safeDate, safeNumber, siteIdOf, siteOfTagId, siteTagIdOf, tagIdOf, titleKey
+    mapLimit, safeDate, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, tagIdOf, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.0.1',
+    version: '1.0.2',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -246,21 +246,35 @@ export class TagFusion extends Source {
     // =========================================================================
 
     override async getSearchResults(query: SearchRequest, metadata: unknown): Promise<PagedResults> {
+        try {
+            return await this.doSearch(query, metadata)
+        } catch (e) {
+            await this.debug(`recherche : erreur ${e instanceof Error ? e.message : String(e)}`)
+            return App.createPagedResults({ results: [] })
+        }
+    }
+
+    private async doSearch(query: SearchRequest, metadata: unknown): Promise<PagedResults> {
         const unified = await this.store.unified()
         const inc = query.includedTags ?? []
         const included = inc.map(t => keyOfTagId(t.id)).filter((k): k is string => k !== null)
         const excluded = (query.excludedTags ?? []).map(t => keyOfTagId(t.id)).filter((k): k is string => k !== null)
         const onlySites = inc.map(t => siteOfTagId(t.id)).filter((k): k is string => k !== null)
         const title = (query.title ?? '').trim()
+        await this.debug(`recherche lancée : ${included.length} tag(s), titre « ${title} », page suivante : ${metadata ? 'oui' : 'non'}`)
 
         if (included.length === 0 && title === '') return App.createPagedResults({ results: [] })
 
         let sites = (await this.store.getSites()).map(siteIdOf)
         if (onlySites.length) sites = sites.filter(s => onlySites.includes(s))
 
-        const meta: SearchMeta = isSearchMeta(metadata) ? metadata : { sites: {}, seen: [] }
+        // Copie indépendante : on ne modifie jamais l'objet que l'app nous a confié
+        const meta: SearchMeta = isSearchMeta(metadata)
+            ? JSON.parse(JSON.stringify(metadata)) as SearchMeta
+            : { sites: {}, seen: [] }
         const seen = new Set(meta.seen)
-        let results: PartialSourceManga[] = []
+        const results: PartialSourceManga[] = []
+        const ids = new Set<string>()
 
         // On boucle tant qu'on n'a rien à montrer mais qu'il reste des pages quelque part
         for (let round = 0; round < 3 && results.length === 0; round++) {
@@ -272,24 +286,43 @@ export class TagFusion extends Source {
                 const siteId = active[i] as string
                 const out: PartialSourceManga[] = []
                 for (const it of items) {
-                    const k = titleKey(it.title)
-                    if (seen.has(k)) continue
-                    seen.add(k)
+                    const mangaId = encodeMangaId(siteId, it.url)
+                    // Doublons : même manga (ID) ou même titre sur un autre site. Un ID en double fait planter l'app.
+                    const tk = titleKey(it.title)
+                    const dedupe = tk.length >= 3 ? 't' + tk : 'i' + mangaId
+                    if (ids.has(mangaId) || seen.has(dedupe) || seen.has('i' + mangaId)) continue
+                    ids.add(mangaId)
+                    seen.add(dedupe)
+                    seen.add('i' + mangaId)
                     out.push(App.createPartialSourceManga({
-                        mangaId: encodeMangaId(siteId, it.url),
-                        title: it.title || 'Sans titre',
-                        image: it.image,
-                        subtitle: info[siteId]?.name || siteId
+                        mangaId,
+                        title: (it.title || 'Sans titre').slice(0, 200),
+                        image: safeUrl(it.image),
+                        subtitle: (info[siteId]?.name || siteId).slice(0, 60)
                     }))
                 }
                 return out
             })
-            results = interleave(lists)
+            results.push(...interleave(lists))
         }
 
-        meta.seen = [...seen]
+        // On garde seulement les clés récentes pour que la pagination reste légère
+        meta.seen = [...seen].slice(-600)
         const finished = sites.every(s => meta.sites[s]?.done)
+        await this.debug(`recherche : ${results.length} résultat(s) renvoyé(s) à l'app, ${finished ? 'fin de liste' : 'encore des pages'}`)
         return App.createPagedResults({ results, metadata: finished ? undefined : meta })
+    }
+
+    /** Petit journal visible dans les réglages, pour savoir où ça coince */
+    private async debug(line: string): Promise<void> {
+        try {
+            const prev = await this.stateManager.retrieve('tf_debug')
+            const lines = Array.isArray(prev) ? prev.filter((x): x is string => typeof x === 'string') : []
+            const t = new Date()
+            const hh = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}:${String(t.getSeconds()).padStart(2, '0')}`
+            lines.push(`${hh} ${line}`)
+            await this.stateManager.store('tf_debug', lines.slice(-12))
+        } catch { /* le journal ne doit jamais gêner */ }
     }
 
     /** Charge la page suivante d'UN site pour cette recherche */
@@ -384,7 +417,7 @@ export class TagFusion extends Source {
             id: mangaId,
             mangaInfo: App.createMangaInfo({
                 titles: [d.title || 'Sans titre', ...d.altTitles].filter(Boolean),
-                image: d.image,
+                image: safeUrl(d.image),
                 desc: d.desc || '',
                 status: d.status || 'Unknown',
                 author: d.author || '',
@@ -417,7 +450,7 @@ export class TagFusion extends Source {
         const engine = await this.engineOf(siteId)
         const pageUrl = engine.chapterPageUrl(base + decodeChapterId(chapterId))
         const html = await this.fetcher.get(pageUrl)
-        const pages = engine.parsePages(this.fetcher.load(html), html, pageUrl)
+        const pages = engine.parsePages(this.fetcher.load(html), html, pageUrl).map(p => safeUrl(p, '')).filter(Boolean)
         // Les images sont souvent sur un autre serveur qui exige le site comme Referer
         for (const p of pages) this.imageReferers.set(hostOf(p), `${base}/`)
         return App.createChapterDetails({ id: chapterId, mangaId, pages })

@@ -187,6 +187,13 @@ export class Store {
         return tagKey(label, await this.customMerges())
     }
 
+    // --- Journal de diagnostic -------------------------------------------------
+
+    async getDebugLines(): Promise<string[]> {
+        const v = await this.state.retrieve('tf_debug')
+        return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+    }
+
     // --- Cloudflare ---------------------------------------------------------------
 
     async setCloudflareTarget(base: string): Promise<void> {

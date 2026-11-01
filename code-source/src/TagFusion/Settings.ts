@@ -77,6 +77,11 @@ export async function buildSettings(store: Store, actions: SettingsActions): Pro
                 label: 'État des sites',
                 value: await statusText(store).catch(() => 'État indisponible pour le moment.')
             }),
+            App.createDUIMultilineLabel({
+                id: 'debug',
+                label: 'Journal (diagnostic)',
+                value: await store.getDebugLines().then(l => l.length ? l.join('\n') : 'Vide pour l\'instant.').catch(() => 'Indisponible.')
+            }),
             App.createDUIButton({
                 id: 'clear',
                 label: 'Effacer tous les tags appris',

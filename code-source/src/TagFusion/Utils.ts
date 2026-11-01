@@ -108,6 +108,23 @@ export function safeDate(d: Date | undefined, now: number = Date.now()): Date {
     return d instanceof Date && !isNaN(d.getTime()) ? d : new Date(now)
 }
 
+/** Image de secours quand un site n'en fournit pas (une image vide peut faire planter l'app) */
+export const FALLBACK_IMAGE = 'https://quagen244.github.io/tagfusion/TagFusion/includes/icon.png'
+
+/**
+ * URL toujours valide pour iOS : absolue, en http(s), sans espaces ni caractères interdits.
+ * Une URL mal formée peut faire planter l'affichage natif de Paperback.
+ */
+export function safeUrl(u: string | undefined, fallback = FALLBACK_IMAGE): string {
+    let s = (u ?? '').trim()
+    if (s.startsWith('//')) s = 'https:' + s
+    if (!/^https?:\/\/[^/\s]+/i.test(s)) return fallback
+    s = s.replace(/[^\x21-\x7E]|["<>\\^`{|}]/g, c => encodeURIComponent(c))
+    // Pas de double encodage du "%" déjà présent, mais un "%" isolé est invalide
+    s = s.replace(/%(?![0-9A-Fa-f]{2})/g, '%25')
+    return s
+}
+
 /** Nombre toujours valide */
 export function safeNumber(n: number, fallback = 0): number {
     return typeof n === 'number' && isFinite(n) ? n : fallback
