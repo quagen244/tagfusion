@@ -21,16 +21,16 @@ import {
 } from '@paperback/types'
 import { CheerioAPI } from 'cheerio'
 import { galleryPages, parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
-import { Details, detectEngine, Engine, engineByName, Fetcher, ListingItem } from './Engines'
+import { Details, detectEngine, Engine, engineByName, Fetcher, findNextPageUrl, ListingItem, pageCandidates } from './Engines'
 import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
 import {
     cleanTagLabel, decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
-    mapLimit, pagedUrl, safeDate, safeEncode, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, tagKey, titleKey
+    mapLimit, safeDate, safeEncode, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, tagKey, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.6.1',
+    version: '1.6.2',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -47,7 +47,13 @@ export const TagFusionInfo: SourceInfo = {
 
 /** Où on en est sur chaque site pendant un défilement de résultats */
 interface SearchMeta {
-    sites: Record<string, { page: number, done: boolean, firstUrl?: string, mode?: string, cpage?: number, offset?: number }>
+    sites: Record<string, {
+        page: number, done: boolean, firstUrl?: string, mode?: string
+        /** Lien "page suivante" lu sur la dernière page, et façon de paginer ('links' = liens du site, 'guess' = formats courants) */
+        next?: string, pg?: 'links' | 'guess'
+        /** Catalogue : page en cours, position dans la page, adresse résolue, lien suivant, façon de paginer */
+        cpage?: number, offset?: number, ccur?: string, cnext?: string, cpg?: 'links' | 'guess'
+    }>
     seen: string[]
     /** Tour de rôle des sites parcourus par leur catalogue */
     cursor?: number
@@ -170,7 +176,8 @@ export class TagFusion extends Source {
         const html = await this.fetcher.get(`${base}/`)
         const engine = detectEngine(html)
         const $ = this.fetcher.load(html)
-        const name = ($('meta[property="og:site_name"]').attr('content') ?? $('title').first().text().split(/[-|–]/)[0] ?? siteId).trim() || siteId
+        // Nom du site : og:site_name, sinon le titre coupé seulement sur " - ", " | ", " – " (pas "E-Hentai" -> "E")
+        const name = ($('meta[property="og:site_name"]').attr('content') ?? $('title').first().text().split(/\s+[-|–—:]\s+/)[0] ?? siteId).trim() || siteId
         await this.store.updateSite(siteId, { base, engine: engine.name, name })
         return engine
     }
@@ -611,6 +618,31 @@ export class TagFusion extends Source {
     }
 
     /**
+     * Récupère la page n d'une liste en suivant la vraie pagination du site.
+     * Page 1 : l'adresse de départ. Ensuite : le lien "suivant" lu sur la page précédente
+     * ('links'), ou les formats courants si le site n'en a pas ('guess').
+     * Retourne null s'il n'y a pas de page n (fin de la liste) — ce n'est pas une erreur.
+     */
+    private async fetchListing(firstUrl: string, page: number, prevNext: string | undefined, mode: 'links' | 'guess' | undefined, engine: Engine, base: string)
+        : Promise<{ items: ListingItem[], url: string, next?: string, mode: 'links' | 'guess' } | null> {
+        const candidates = page === 1 ? [firstUrl] : mode === 'links' ? (prevNext ? [prevNext] : []) : pageCandidates(firstUrl, page)
+        for (const url of candidates) {
+            let html: string
+            try { html = await this.fetcher.get(url) } catch (e) {
+                // Cloudflare : on remonte l'erreur (le site doit être débloqué) ; une page absente : format suivant
+                if (e instanceof Error && /Cloudflare/.test(e.message)) throw e
+                if (page === 1) throw e
+                continue
+            }
+            const $ = this.fetcher.load(html)
+            const items = engine.parseListing($, url, base)
+            const next = findNextPageUrl($, url, page)
+            return { items, url, ...(next ? { next } : {}), mode: page === 1 ? (next ? 'links' : 'guess') : (mode ?? 'guess') }
+        }
+        return null
+    }
+
+    /**
      * Charge la suite d'UN site pour cette recherche. De la plus rapide à la plus complète :
      *  - le site a une page pour ce(s) tag(s) : on la parcourt (et on vérifie les autres tags s'il y en a) ;
      *  - sinon on parcourt son catalogue complet, par lots de quelques fiches, en vérifiant les tags.
@@ -620,6 +652,7 @@ export class TagFusion extends Source {
         included: string[], excluded: string[], title: string
     ): Promise<ListingItem[]> {
         const state = meta.sites[siteId] ?? (meta.sites[siteId] = { page: 0, done: false })
+        let firstPage = false
         try {
             const engine = await this.engineOf(siteId)
             const base = await this.baseOf(siteId)
@@ -632,14 +665,26 @@ export class TagFusion extends Source {
                 const catalog = await this.catalogOf(siteId, engine, base)
                 if (!catalog) { state.done = true; return [] }
                 const cpage = state.cpage ?? 1
+                firstPage = cpage === 1 && !state.offset
                 const offset = state.offset ?? 0
-                const url = pagedUrl(catalog, cpage)
-                const items = engine.parseListing(this.fetcher.load(await this.fetcher.get(url)), url, base)
+                const res = state.ccur
+                    ? await this.fetchListing(state.ccur, 1, undefined, undefined, engine, base)
+                    : await this.fetchListing(catalog, cpage, state.cnext, state.cpg, engine, base)
+                if (!res) { state.done = true; return [] }
+                if (!state.ccur) { state.ccur = res.url; if (cpage === 1) state.cpg = res.mode }
+                const items = res.items
                 const first = items[0]?.url
-                if (!first || (cpage > 1 && first === state.firstUrl)) { state.done = true; return [] }
+                if (!first || (cpage > 1 && offset === 0 && first === state.firstUrl)) { state.done = true; return [] }
                 if (cpage === 1) state.firstUrl = first
                 let batch = items.slice(offset, offset + CRAWL_BATCH)
-                if (offset + CRAWL_BATCH >= items.length) { state.cpage = cpage + 1; state.offset = 0 } else state.offset = offset + CRAWL_BATCH
+                if (offset + CRAWL_BATCH >= items.length) {
+                    // Page du catalogue terminée : la suivante sera celle du lien "suivant"
+                    state.cpage = cpage + 1
+                    state.offset = 0
+                    state.ccur = undefined
+                    state.cnext = res.next
+                    if (state.cpg === 'links' && !res.next) state.done = true
+                } else state.offset = offset + CRAWL_BATCH
                 if (title) batch = batch.filter(i => titleKey(i.title).includes(titleKey(title)))
                 const found = await this.verifyItems(siteId, batch, included, excluded)
                 await this.debug(`recherche ${siteId} : catalogue p.${cpage} (${offset + 1}-${offset + batch.length}), ${found.length} trouvé(s)`)
@@ -648,34 +693,43 @@ export class TagFusion extends Source {
 
             // --- Page du tag (ou recherche par titre) ---
             const page = state.page + 1
-            let url: string
+            firstPage = page === 1
+            let firstUrl: string
             let mustCheckTags = excluded.length > 0
             if (included.length === 0) {
-                url = engine.searchUrl(base, title, page)
+                firstUrl = engine.searchUrl(base, title, 1)
                 state.mode = 'titre'
             } else if (withPage.length === siteTags.length) {
-                const combined = engine.combinedUrl(base, withPage, page)
-                url = combined ?? engine.listingUrl(withPage[0] as SiteTag, page)
+                const combined = engine.combinedUrl(base, withPage, 1)
+                firstUrl = combined ?? engine.listingUrl(withPage[0] as SiteTag, 1)
                 if (!combined && withPage.length > 1) mustCheckTags = true
                 state.mode = 'page du tag'
             } else {
                 // Un des tags a une page sur ce site : on la parcourt et on vérifie les autres
-                url = engine.listingUrl(withPage[0] as SiteTag, page)
+                firstUrl = engine.listingUrl(withPage[0] as SiteTag, 1)
                 mustCheckTags = true
                 state.mode = 'page du tag + vérification'
             }
 
-            let items = engine.parseListing(this.fetcher.load(await this.fetcher.get(url)), url, base)
+            const res = await this.fetchListing(firstUrl, page, state.next, state.pg, engine, base)
+            if (!res) { state.done = true; return [] }
             state.page = page
+            state.pg = res.mode
+            state.next = res.next
+            let items = res.items
             // Fin de liste : page vide, ou le site renvoie encore la page 1
             const first = items[0]?.url
             if (!first || (page > 1 && first === state.firstUrl)) { state.done = true; return [] }
             if (page === 1) state.firstUrl = first
+            // Pagination par liens et plus de lien "suivant" : c'était la dernière page
+            if (res.mode === 'links' && !res.next) state.done = true
             if (title && included.length > 0) items = items.filter(i => titleKey(i.title).includes(titleKey(title)))
             return mustCheckTags ? this.verifyItems(siteId, items, included, excluded) : items
         } catch (e) {
             state.done = true
-            await this.store.updateSite(siteId, { error: e instanceof Error ? e.message : String(e) })
+            // Seule une vraie panne (première page, Cloudflare) est notée comme erreur du site
+            const msg = e instanceof Error ? e.message : String(e)
+            if (firstPage || /Cloudflare/.test(msg)) await this.store.updateSite(siteId, { error: msg })
             return []
         }
     }

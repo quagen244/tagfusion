@@ -466,6 +466,67 @@ export const ThemesiaEngine: Engine = {
     }
 }
 
+// --- Pagination réelle des listes ------------------------------------------------
+
+/** Chemin "normalisé" d'une page de liste : sans requête ni numéro de page final */
+function listPathKey(url: string): string {
+    return (/^https?:\/\/[^/]+(\/[^?#]*)?/i.exec(url)?.[1] ?? '/').toLowerCase().replace(/\/(page\/)?\d+\/?$/, '').replace(/\/$/, '')
+}
+
+/**
+ * Lien vers la page suivante d'une liste, tel que le site l'écrit lui-même
+ * (rel="next", bouton "Suivant / › / »", ou lien "N+1" dans la pagination).
+ * Évite de deviner le format : "/page/2/", "?page=2", "/2/"… varient selon les sites.
+ */
+export function findNextPageUrl($: CheerioAPI, pageUrl: string, page: number): string | undefined {
+    const cur = pageUrl.replace(/#.*$/, '')
+    const host = hostOf(pageUrl)
+    const usable = (href: string | undefined): string | undefined => {
+        const u = absoluteUrl(href, pageUrl)
+        if (!u || hostOf(u) !== host) return undefined
+        const clean = u.replace(/#.*$/, '')
+        return clean !== cur ? clean : undefined
+    }
+    for (const sel of ['link[rel="next"]', 'a[rel="next"]']) {
+        const u = usable($(sel).first().attr('href'))
+        if (u) return u
+    }
+    const nextNum = String(page + 1)
+    let found: string | undefined
+    // Lien "N+1" dans une zone de pagination
+    $('[class*="pagination"] a[href], [class*="pager"] a[href], [class*="paging"] a[href], [class*="page-numbers"] a[href], [class*="pagenavi"] a[href], [class*="nav-links"] a[href], [class*="pages"] a[href]').each((_, el) => {
+        if (!found && clean($(el).text()) === nextNum) found = usable($(el).attr('href'))
+    })
+    if (found) return found
+    // Bouton "suivant"
+    $('a[href]').each((_, el) => {
+        if (found) return
+        const cls = el.attribs['class'] ?? ''
+        const text = clean($(el).text()).toLowerCase()
+        if (/(^|[\s_-])next([\s_-]|$)|nextpostslink/i.test(cls) || /^(next|next page|suivant|suivante|page suivante|siguiente|weiter|›|»|>|→|>>)$/.test(text)) found = usable($(el).attr('href'))
+    })
+    if (found) return found
+    // Lien "N+1" n'importe où, s'il pointe vers la même liste
+    const key = listPathKey(cur)
+    $('a[href]').each((_, el) => {
+        if (found || clean($(el).text()) !== nextNum) return
+        const u = usable($(el).attr('href'))
+        if (u && listPathKey(u) === key) found = u
+    })
+    return found
+}
+
+/** Formats de page courants, pour les sites sans lien "suivant" lisible */
+export function pageCandidates(url: string, n: number): string[] {
+    const u = url.replace(/#.*$/, '')
+    const q = u.indexOf('?')
+    const path = q >= 0 ? u.slice(0, q) : u
+    const query = q >= 0 ? u.slice(q) : ''
+    const withQuery = /[?&]page=\d+/.test(u) ? u.replace(/([?&]page=)\d+/, `$1${n}`) : `${u}${q >= 0 ? '&' : '?'}page=${n}`
+    const slashN = path.replace(/\/(page\/)?\d+\/?$/, '').replace(/\/?$/, `/${n}/`) + query
+    return [...new Set([pagedUrl(u, n), withQuery, slashN])]
+}
+
 export const ENGINES: Engine[] = [MadaraEngine, ThemesiaEngine, GenericEngine]
 
 export function engineByName(name: EngineName | undefined): Engine {

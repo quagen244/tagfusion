@@ -42,6 +42,24 @@ for (let p = 1; p <= 7; p++) {
     GET[url] = p <= 6 ? page(Array.from({ length: 10 }, (_, i) => card('big.test', `big${(p - 1) * 10 + i + 1}`, `Big ${(p - 1) * 10 + i + 1}`)).join('')) : page('<p>Fin</p>')
 }
 
+// --- Quatre formats de pagination (et "/page/2/" qui répond 404 partout, comme sur les vrais sites) ---
+const pcard = (site: string, n: number): string => card(site, `p${n}`, `${site.split('.')[0]} ${n}`)
+const PAG: Record<string, { tag: string, pageUrl: (n: number) => string, nav: (n: number) => string }> = {
+    'qpage.test': { tag: '/tag/romance/', pageUrl: n => n === 1 ? '/tag/romance/' : `/tag/romance/?page=${n}`,
+        nav: n => n < 3 ? `<section class="pagination"><a class="page" href="/tag/romance/?page=${n + 1}">${n + 1}</a><a class="next" href="/tag/romance/?page=${n + 1}"><i class="fa"></i></a></section>` : '' },
+    'slashn.test': { tag: '/hentai-list/category/Romance/', pageUrl: n => n === 1 ? '/hentai-list/category/Romance/' : `/hentai-list/category/Romance/all/last-updated/${n}/`,
+        nav: n => n < 3 ? `<ul class="pagination"><li><a href="/hentai-list/category/Romance/all/last-updated/${n + 1}/">${n + 1}</a></li></ul>` : '' },
+    'relnext.test': { tag: '/tags/romance', pageUrl: n => n === 1 ? '/tags/romance' : `/tags/romance?pg=${n}`,
+        nav: n => n < 3 ? `<link rel="next" href="/tags/romance?pg=${n + 1}">` : '' },
+    'jsonly.test': { tag: '/genre/romance/', pageUrl: n => n === 1 ? '/genre/romance/' : `/genre/romance/?page=${n}`, nav: () => '' }
+}
+for (const [site, cfg] of Object.entries(PAG)) {
+    GET[`https://${site}/`] = page(`<nav class="genres-menu"><a href="https://${site}${cfg.tag}">Romance</a></nav>`)
+    for (let n = 1; n <= 3; n++) GET[`https://${site}${cfg.pageUrl(n)}`] = page(cfg.nav(n) + [1, 2, 3, 4].map(i => pcard(site, (n - 1) * 4 + i)).join(''))
+    // Page 4 en "?page=4" : vide (fin de liste), pour le site sans liens
+    if (site === 'jsonly.test') GET[`https://${site}/genre/romance/?page=4`] = page('<p>Fin</p>')
+}
+
 // --- Fiches pour les tests de chapitres ---
 GET['https://legacy.test/'] = page('<p>x</p>')
 GET['https://legacy.test/manga/old_one/'] = details('Old One', ['Action'], 3)
@@ -216,12 +234,31 @@ async function main(): Promise<void> {
     assert.equal(batches.slice(0, -1).filter(n => n === 0).length, 0, 'aucune page vide avant la fin')
     console.log(`✓ Grand site (60 mangas pour le tag) : fournées de ${batches.join(' + ')} en faisant défiler, tous affichés`)
 
+    // --- Défilement infini quelle que soit la pagination du site ---
+    await src.store.setSites(Object.keys(PAG).map(x => `https://${x}`))
+    await src.discoverAll(true)
+    const pagIds = new Set<string>()
+    let pm: unknown = undefined
+    let pguard = 0
+    do {
+        const pr = await src.getSearchResults({ includedTags: [tag], excludedTags: [] }, pm)
+        for (const m of pr.results) pagIds.add(m.title)
+        pm = pr.metadata
+    } while (pm !== undefined && pguard++ < 20)
+    for (const site of Object.keys(PAG)) {
+        const got = [...pagIds].filter(t => t.startsWith(site.split('.')[0] + ' ')).length
+        assert.equal(got, 12, `${site} : ${got}/12 mangas (pagination mal suivie)`)
+    }
+    const infos = await src.store.getSiteInfo()
+    for (const site of Object.keys(PAG)) assert.equal(infos[site]?.error, undefined, `${site} marqué en erreur : ${infos[site]?.error}`)
+    console.log('✓ Pagination « ?page=N », « /…/N/ », rel=next et sans lien : les 12 mangas de chaque site, aucune erreur 404 notée')
+
     // --- Réinitialisation partielle : index et tags effacés, sites gardés ---
     assert.ok(await src.store.indexSize() > 0)
     await src.resetExtension(false)
     assert.equal(await src.store.indexSize(), 0)
     assert.equal(Object.keys(await src.store.unified()).length, 0)
-    assert.equal((await src.store.getSites()).length, 1)
+    assert.equal((await src.store.getSites()).length, 4)
     console.log('✓ « Effacer l\'index et les tags » : index vide, tags vides, sites conservés')
 
     // --- Réinitialisation complète ---
