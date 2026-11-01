@@ -10,6 +10,7 @@ import {
     Response,
     SearchRequest,
     Source,
+    SourceInterceptor,
     SourceInfo,
     SourceIntents,
     SourceManga,
@@ -21,11 +22,12 @@ import { Details, detectEngine, Engine, engineByName, Fetcher, ListingItem } fro
 import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
 import {
-    decodeMangaId, encodeMangaId, hostOf, interleave, mapLimit, pathOf, siteIdOf, titleKey
+    decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
+    mapLimit, safeDate, safeNumber, siteIdOf, siteOfTagId, siteTagIdOf, tagIdOf, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.0.0',
+    version: '1.0.1',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -45,9 +47,27 @@ interface SearchMeta {
     seen: string[]
 }
 
-const TAG_PREFIX = 't:'
-const SITE_PREFIX = 's:'
-const DISCOVERY_BUDGET_MS = 20000
+const DISCOVERY_BUDGET_MS = 12000
+
+/** Ajoute le Referer attendu par les sites (et leurs serveurs d'images) */
+class RefererInterceptor implements SourceInterceptor {
+    constructor(private readonly referers: Map<string, string>) {}
+
+    async interceptRequest(request: Request): Promise<Request> {
+        const headers = request.headers ?? {}
+        if (!headers['referer'] && !headers['Referer']) {
+            const origin = (/^https?:\/\/[^/]+/i.exec(request.url) ?? [''])[0]
+            headers['referer'] = this.referers.get(hostOf(request.url)) ?? `${origin}/`
+        }
+        // Il faut réassigner l'objet pour que l'app voie la modification
+        request.headers = headers
+        return request
+    }
+
+    async interceptResponse(response: Response): Promise<Response> {
+        return response
+    }
+}
 
 export class TagFusion extends Source {
     stateManager = App.createSourceStateManager()
@@ -61,19 +81,7 @@ export class TagFusion extends Source {
     requestManager = App.createRequestManager({
         requestsPerSecond: 8,
         requestTimeout: 20000,
-        interceptor: {
-            interceptRequest: async (request: Request): Promise<Request> => {
-                const headers = request.headers ?? {}
-                if (!headers['referer'] && !headers['Referer']) {
-                    const origin = (/^https?:\/\/[^/]+/i.exec(request.url) ?? [''])[0]
-                    headers['referer'] = this.imageReferers.get(hostOf(request.url)) ?? `${origin}/`
-                }
-                // Il faut réassigner l'objet pour que l'app voie la modification
-                request.headers = headers
-                return request
-            },
-            interceptResponse: async (response: Response): Promise<Response> => response
-        }
+        interceptor: new RefererInterceptor(this.imageReferers)
     })
 
     private readonly fetcher: Fetcher = {
@@ -192,38 +200,45 @@ export class TagFusion extends Source {
     }
 
     override async getSearchTags(): Promise<TagSection[]> {
-        const sites = await this.store.getSites()
-        if (sites.length === 0) {
-            return [App.createTagSection({ id: 'empty', label: 'Aucun site : ouvre les réglages de TagFusion > Mes sites', tags: [] })]
-        }
-        // Premier passage : on découvre les tags des nouveaux sites (avec une limite de temps)
-        await this.discoverAll(false, Date.now() + DISCOVERY_BUDGET_MS)
+        try {
+            const sites = await this.store.getSites()
+            // Aucune section vide : Paperback 0.8 les supporte mal
+            if (sites.length === 0) return []
 
-        const unified = Object.values(await this.store.unified())
-            .sort((a, b) => a.label.localeCompare(b.label))
-        const info = await this.store.getSiteInfo()
+            // Si on ne connaît encore aucun tag, on attend la découverte (avec une limite de temps).
+            // Sinon, on complète en arrière-plan pour ne pas bloquer l'écran de recherche.
+            const known = Object.keys(await this.store.unified()).length
+            if (known === 0) await this.discoverAll(false, Date.now() + DISCOVERY_BUDGET_MS)
+            else this.discoverAll(false, Date.now() + DISCOVERY_BUDGET_MS).catch(() => undefined)
 
-        const sections: TagSection[] = []
-        const siteTags: Tag[] = sites.map(b => {
-            const id = siteIdOf(b)
-            return App.createTag({ id: SITE_PREFIX + id, label: info[id]?.name ?? id })
-        })
-        sections.push(App.createTagSection({ id: 'sites', label: 'Limiter à certains sites', tags: siteTags }))
+            const unified = Object.values(await this.store.unified())
+                .sort((a, b) => a.label.localeCompare(b.label))
+            const info = await this.store.getSiteInfo()
 
-        // Une section par lettre pour que la liste reste lisible
-        const byLetter = new Map<string, Tag[]>()
-        for (const u of unified) {
-            const first = u.label.normalize('NFD').charAt(0).toUpperCase()
-            const letter = /[A-Z]/.test(first) ? first : '#'
-            const list = byLetter.get(letter) ?? []
-            const count = Object.keys(u.sites).length
-            list.push(App.createTag({ id: TAG_PREFIX + u.key, label: count > 1 ? `${u.label} · ${count}` : u.label }))
-            byLetter.set(letter, list)
+            const sections: TagSection[] = []
+            const siteTags: Tag[] = sites.map(b => {
+                const id = siteIdOf(b)
+                return App.createTag({ id: siteTagIdOf(id), label: info[id]?.name || id })
+            })
+            sections.push(App.createTagSection({ id: 'sites', label: 'Limiter à certains sites', tags: siteTags }))
+
+            // Une section par lettre pour que la liste reste lisible
+            const byLetter = new Map<string, Tag[]>()
+            for (const u of unified) {
+                const first = u.label.normalize('NFD').charAt(0).toUpperCase()
+                const letter = /[A-Z]/.test(first) ? first : 'other'
+                const list = byLetter.get(letter) ?? []
+                const count = Object.keys(u.sites).length
+                list.push(App.createTag({ id: tagIdOf(u.key), label: count > 1 ? `${u.label} (${count})` : u.label }))
+                byLetter.set(letter, list)
+            }
+            for (const [letter, tags] of [...byLetter.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+                if (tags.length) sections.push(App.createTagSection({ id: `letter_${letter}`, label: letter === 'other' ? '#' : letter, tags }))
+            }
+            return sections
+        } catch {
+            return []
         }
-        for (const [letter, tags] of [...byLetter.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-            sections.push(App.createTagSection({ id: `letter_${letter}`, label: letter, tags }))
-        }
-        return sections
     }
 
     // =========================================================================
@@ -232,9 +247,10 @@ export class TagFusion extends Source {
 
     override async getSearchResults(query: SearchRequest, metadata: unknown): Promise<PagedResults> {
         const unified = await this.store.unified()
-        const included = query.includedTags.filter(t => t.id.startsWith(TAG_PREFIX)).map(t => t.id.slice(TAG_PREFIX.length))
-        const excluded = (query.excludedTags ?? []).filter(t => t.id.startsWith(TAG_PREFIX)).map(t => t.id.slice(TAG_PREFIX.length))
-        const onlySites = query.includedTags.filter(t => t.id.startsWith(SITE_PREFIX)).map(t => t.id.slice(SITE_PREFIX.length))
+        const inc = query.includedTags ?? []
+        const included = inc.map(t => keyOfTagId(t.id)).filter((k): k is string => k !== null)
+        const excluded = (query.excludedTags ?? []).map(t => keyOfTagId(t.id)).filter((k): k is string => k !== null)
+        const onlySites = inc.map(t => siteOfTagId(t.id)).filter((k): k is string => k !== null)
         const title = (query.title ?? '').trim()
 
         if (included.length === 0 && title === '') return App.createPagedResults({ results: [] })
@@ -261,9 +277,9 @@ export class TagFusion extends Source {
                     seen.add(k)
                     out.push(App.createPartialSourceManga({
                         mangaId: encodeMangaId(siteId, it.url),
-                        title: it.title,
+                        title: it.title || 'Sans titre',
                         image: it.image,
-                        subtitle: info[siteId]?.name ?? siteId
+                        subtitle: info[siteId]?.name || siteId
                     }))
                 }
                 return out
@@ -361,18 +377,18 @@ export class TagFusion extends Source {
             const key = await this.store.keyFor(t.label)
             if (!key || ids.has(key)) continue
             ids.add(key)
-            tags.push(App.createTag({ id: TAG_PREFIX + key, label: t.label }))
+            tags.push(App.createTag({ id: tagIdOf(key), label: t.label }))
         }
 
         return App.createSourceManga({
             id: mangaId,
             mangaInfo: App.createMangaInfo({
-                titles: [d.title, ...d.altTitles].filter(Boolean),
+                titles: [d.title || 'Sans titre', ...d.altTitles].filter(Boolean),
                 image: d.image,
-                desc: d.desc,
-                status: d.status,
-                author: d.author,
-                artist: d.artist,
+                desc: d.desc || '',
+                status: d.status || 'Unknown',
+                author: d.author || '',
+                artist: d.artist || '',
                 hentai: false,
                 tags: [App.createTagSection({ id: 'tags', label: 'Tags', tags })]
             })
@@ -387,10 +403,10 @@ export class TagFusion extends Source {
         const $ = this.fetcher.load(await this.fetcher.get(url))
         const chapters = await engine.getChapters(this.fetcher, url, $, base)
         return chapters.map((c, i) => App.createChapter({
-            id: pathOf(c.url),
-            chapNum: c.num >= 0 ? c.num : 0,
-            name: c.name,
-            time: c.date,
+            id: encodeChapterId(c.url),
+            chapNum: c.num >= 0 ? safeNumber(c.num) : 0,
+            name: c.name || `Chapitre ${chapters.length - i}`,
+            time: safeDate(c.date),
             sortingIndex: -i
         }))
     }
@@ -399,7 +415,7 @@ export class TagFusion extends Source {
         const { siteId } = decodeMangaId(mangaId)
         const base = await this.baseOf(siteId)
         const engine = await this.engineOf(siteId)
-        const pageUrl = engine.chapterPageUrl(base + chapterId)
+        const pageUrl = engine.chapterPageUrl(base + decodeChapterId(chapterId))
         const html = await this.fetcher.get(pageUrl)
         const pages = engine.parsePages(this.fetcher.load(html), html, pageUrl)
         // Les images sont souvent sur un autre serveur qui exige le site comme Referer
@@ -408,8 +424,12 @@ export class TagFusion extends Source {
     }
 
     override getMangaShareUrl(mangaId: string): string {
-        const { siteId, path } = decodeMangaId(mangaId)
-        return `https://${siteId}${path}`
+        try {
+            const { siteId, path } = decodeMangaId(mangaId)
+            return `https://${siteId}${path}`
+        } catch {
+            return 'https://paperback.moe'
+        }
     }
 }
 

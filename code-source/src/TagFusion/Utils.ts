@@ -51,18 +51,66 @@ export function pathOf(url: string): string {
 }
 
 // --- IDs Paperback -----------------------------------------------------------
-// mangaId   = "site.com::/manga/one-piece/"
-// chapterId = "/manga/one-piece/chapter-1/"  (le site est déjà dans mangaId)
-const SEP = '::'
+// Paperback utilise les IDs comme clés internes (base de données, téléchargements) :
+// on les garde limités à [A-Za-z0-9._-], sans "/", ":" ni espaces.
+
+/** Encode n'importe quel texte avec seulement A-Z a-z 0-9 . - _ (réversible) */
+export function safeEncode(s: string): string {
+    return encodeURIComponent(s)
+        .replace(/[!'()*~_]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase())
+        .replace(/%/g, '_')
+}
+
+export function safeDecode(s: string): string {
+    return decodeURIComponent(s.replace(/_/g, '%'))
+}
+
+const ID_SEP = '\n'
 
 export function encodeMangaId(siteId: string, url: string): string {
-    return siteId + SEP + pathOf(url)
+    return safeEncode(siteId + ID_SEP + pathOf(url))
 }
 
 export function decodeMangaId(mangaId: string): { siteId: string, path: string } {
-    const i = mangaId.indexOf(SEP)
+    const raw = safeDecode(mangaId)
+    const i = raw.indexOf(ID_SEP)
     if (i < 0) throw new Error(`ID de manga invalide : ${mangaId}`)
-    return { siteId: mangaId.slice(0, i), path: mangaId.slice(i + SEP.length) }
+    return { siteId: raw.slice(0, i), path: raw.slice(i + ID_SEP.length) }
+}
+
+export function encodeChapterId(url: string): string {
+    return safeEncode(pathOf(url))
+}
+
+export function decodeChapterId(chapterId: string): string {
+    return safeDecode(chapterId)
+}
+
+/** ID de tag pour Paperback : "tag_sci-fi" <-> clé "sci fi" */
+export function tagIdOf(key: string): string {
+    return 'tag_' + key.replace(/ /g, '-')
+}
+
+export function keyOfTagId(id: string): string | null {
+    return id.startsWith('tag_') ? id.slice(4).replace(/-/g, ' ') : null
+}
+
+export function siteTagIdOf(siteId: string): string {
+    return 'site_' + safeEncode(siteId)
+}
+
+export function siteOfTagId(id: string): string | null {
+    return id.startsWith('site_') ? safeDecode(id.slice(5)) : null
+}
+
+/** Date toujours valide (une date invalide peut faire planter l'app) */
+export function safeDate(d: Date | undefined, now: number = Date.now()): Date {
+    return d instanceof Date && !isNaN(d.getTime()) ? d : new Date(now)
+}
+
+/** Nombre toujours valide */
+export function safeNumber(n: number, fallback = 0): number {
+    return typeof n === 'number' && isFinite(n) ? n : fallback
 }
 
 // --- Tags ----------------------------------------------------------------------

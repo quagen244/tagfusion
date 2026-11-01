@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import {
     absoluteUrl, decodeMangaId, encodeMangaId, interleave, looksLikeChapterUrl, looksLikeMangaUrl,
     looksLikeTagUrl, normalizeBaseUrl, pagedUrl, parseChapterNumber, parseCustomMerges, parseDate,
-    parseSiteList, pickImageSrc, tagKey, titleKey
+    parseSiteList, pickImageSrc, tagKey, titleKey, encodeChapterId, decodeChapterId, tagIdOf,
+    keyOfTagId, siteTagIdOf, siteOfTagId, safeDate, safeNumber
 } from '../src/TagFusion/Utils'
 
 let passed = 0
@@ -27,10 +28,19 @@ test('URLs absolues', () => {
     assert.equal(absoluteUrl('javascript:void(0)', 'https://s.com'), null)
 })
 
-test('IDs aller-retour', () => {
-    const id = encodeMangaId('s.com', 'https://www.s.com/manga/one-piece/?x=1')
-    assert.equal(id, 's.com::/manga/one-piece/?x=1')
-    assert.deepEqual(decodeMangaId(id), { siteId: 's.com', path: '/manga/one-piece/?x=1' })
+test('IDs aller-retour (sans caractères spéciaux)', () => {
+    const id = encodeMangaId('s.com', 'https://www.s.com/manga/one-piece/?x=1&é=2')
+    assert.match(id, /^[A-Za-z0-9._-]+$/)
+    assert.deepEqual(decodeMangaId(id), { siteId: 's.com', path: '/manga/one-piece/?x=1&é=2' })
+    const ch = encodeChapterId('https://s.com/manga/a_b/chapter-1/')
+    assert.match(ch, /^[A-Za-z0-9._-]+$/)
+    assert.equal(decodeChapterId(ch), '/manga/a_b/chapter-1/')
+    assert.equal(keyOfTagId(tagIdOf('sci fi')), 'sci fi')
+    assert.match(tagIdOf('slice of life'), /^[A-Za-z0-9_-]+$/)
+    assert.equal(siteOfTagId(siteTagIdOf('mon-site.com')), 'mon-site.com')
+    assert.equal(keyOfTagId(siteTagIdOf('x.com')), null)
+    assert.ok(!isNaN(safeDate(new Date('pas une date')).getTime()))
+    assert.equal(safeNumber(NaN), 0)
 })
 
 test('Fusion des tags', () => {

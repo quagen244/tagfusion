@@ -35,7 +35,7 @@ export async function buildSettings(store: Store, actions: SettingsActions): Pro
                                     label: 'Sites',
                                     value: App.createDUIBinding({
                                         get: async () => (await store.getSites()).join(', '),
-                                        set: async (v: unknown) => { await store.setSites(parseSiteList(String(v ?? ''))) }
+                                        set: async (v: unknown) => { try { await store.setSites(parseSiteList(String(v ?? ''))) } catch { /* ignoré */ } }
                                     })
                                 })
                             ]
@@ -59,7 +59,7 @@ export async function buildSettings(store: Store, actions: SettingsActions): Pro
                                     label: 'Fusions',
                                     value: App.createDUIBinding({
                                         get: async () => store.getMergesText(),
-                                        set: async (v: unknown) => { await store.setMergesText(String(v ?? '')) }
+                                        set: async (v: unknown) => { try { await store.setMergesText(String(v ?? '')) } catch { /* ignoré */ } }
                                     })
                                 })
                             ]
@@ -70,17 +70,17 @@ export async function buildSettings(store: Store, actions: SettingsActions): Pro
             App.createDUIButton({
                 id: 'discover',
                 label: 'Charger / mettre à jour les tags',
-                onTap: async () => { await actions.discoverAll(true) }
+                onTap: async () => { try { await actions.discoverAll(true) } catch { /* l'erreur est affichée dans l'état des sites */ } }
             }),
             App.createDUIMultilineLabel({
                 id: 'status',
                 label: 'État des sites',
-                value: await statusText(store)
+                value: await statusText(store).catch(() => 'État indisponible pour le moment.')
             }),
             App.createDUIButton({
                 id: 'clear',
                 label: 'Effacer tous les tags appris',
-                onTap: async () => { await store.clearTags() }
+                onTap: async () => { try { await store.clearTags() } catch { /* rien à faire */ } }
             })
         ]
     })
