@@ -180,3 +180,33 @@ assert.deepEqual(sitesFromVersioning({ sources: [
 ] }), ['https://www.site-un.com', 'https://site-deux.net'])
 assert.deepEqual(sitesFromVersioning('pas du json'), [])
 console.log('✓ Import des dépôts')
+
+// --- Nombres d'œuvres collés aux tags ------------------------------------------------
+import { cleanTagLabel } from '../src/TagFusion/Utils'
+for (const [raw, want] of [
+    ['Romance (1 234)', 'Romance'], ['Romance [56]', 'Romance'], ['Romance · 120', 'Romance'], ['Romance - 12.5k', 'Romance'],
+    ['Romance 1,234', 'Romance'], ['Romance1234', 'Romance'], ['(345) Romance', 'Romance'], ['12 · Romance', 'Romance'],
+    ['Romance (89 mangas)', 'Romance'], ['Comédie 98 œuvres', 'Comédie'], ['#Isekai (7)', 'Isekai'],
+    ['R-18', 'R-18'], ['18+', '18+'], ['4-Koma', '4-Koma'], ['Sci-Fi', 'Sci-Fi'], ['Martial Arts', 'Martial Arts']
+] as [string, string][]) assert.equal(cleanTagLabel(raw), want, raw)
+assert.equal(tagKey('Romance (1 234)'), 'romance')
+assert.equal(tagKey('romance 123'), 'romance')
+console.log('✓ Nombres d\'œuvres retirés des tags, vrais noms intacts')
+
+async function countTests(): Promise<void> {
+    const mem = new Map<string, unknown>()
+    const st = { keychain: {} as never, store: async (k: string, v: unknown) => { mem.set(k, JSON.parse(JSON.stringify(v))) }, retrieve: async (k: string) => mem.get(k) }
+    // Données enregistrées par une ancienne version, avec les nombres dedans
+    mem.set('tf_raw_tags', { 'a.com': { 'romance 1234': { label: 'Romance (1234)', url: 'https://a.com/genre/romance/' } } })
+    mem.set('tf_manga_index', { x: { s: 'a.com', u: 'https://a.com/m/x/', t: 'X', i: '', l: ['Action 56'], at: 1 } })
+    const store = new Store(st)
+    await store.addTags('b.net', [{ label: 'Romance', url: 'https://b.net/tags/romance/' }, { label: 'Action [3]', url: 'https://b.net/tags/action/' }])
+    const u = await store.unified()
+    assert.deepEqual(Object.keys(u.romance?.sites ?? {}).sort(), ['a.com', 'b.net'])
+    assert.equal(u.romance?.label, 'Romance')
+    assert.equal(u.action?.indexed, 1)
+    assert.equal(u.action?.label, 'Action')
+    assert.ok(!Object.keys(u).some(k => /\d/.test(k)), 'aucune clé de tag avec un nombre')
+    console.log('✓ Anciennes données avec nombres fusionnées automatiquement (Romance = 2 sites)')
+}
+countTests().catch(e => { console.error(e); process.exit(1) })

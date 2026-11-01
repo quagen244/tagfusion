@@ -257,6 +257,36 @@ const JUNK_TAGS = new Set([
 ])
 
 /** "Sci-Fi ", "sci‑fi", "Science Fiction" -> "sci fi" (forme comparable) */
+/** Mots qui accompagnent parfois le nombre d'œuvres : "Romance (1 234 mangas)" */
+const COUNT_WORDS = '(?:mangas?|manhwas?|manhuas?|webtoons?|titres?|titles?|series|séries|works?|oeuvres?|œuvres?|comics?|books?|livres?|entries|résultats?|results?)'
+/** Un nombre d'œuvres : 1234, 1 234, 1,234, 1.234, 12.5k, 3K, 1M */
+const COUNT = '\\d[\\d\\s.,  ]*[kKmM]?'
+
+/**
+ * Enlève le nombre d'œuvres que certains sites collent aux tags, sans abîmer le nom :
+ *   "Romance (1 234)" "Romance [56]" "Romance · 120" "Romance - 12.5k" "Romance 1,234"
+ *   "Romance1234" "(345) Romance" "12 · Romance" "Romance (89 mangas)"  ->  "Romance"
+ * Les vrais noms avec des chiffres restent intacts : "R-18", "18+", "4-Koma", "Sci-Fi".
+ */
+export function cleanTagLabel(raw: string): string {
+    let s = raw.replace(/[\s  ]+/g, ' ').trim()
+    s = s.replace(/^[#•·|]+\s*/, '').trim()
+    // Noms protégés : contenus "R-18", "R18", "18+"
+    if (/^(r[\s-]?\d{2}|\d{2}\s*\+)$/i.test(s)) return s
+    // Nombre en tête : "(345) Romance", "[12] Romance", "12 · Romance"
+    s = s.replace(new RegExp(`^[([{]\\s*${COUNT}\\s*\\+?\\s*${COUNT_WORDS}?\\s*[)\\]}]\\s*`, 'i'), '')
+        .replace(new RegExp(`^${COUNT}\\s+[·•|:–—-]\\s+`, 'i'), '')
+    // Nombre en fin (deux passes pour "Romance (12) · 3")
+    for (let i = 0; i < 2; i++) {
+        s = s.replace(new RegExp(`\\s*[([{]\\s*${COUNT}\\s*\\+?\\s*${COUNT_WORDS}?\\s*[)\\]}]\\s*$`, 'i'), '')
+            .replace(new RegExp(`\\s+[·•|:–—-]\\s*${COUNT}\\s*\\+?\\s*${COUNT_WORDS}?\\s*$`, 'i'), '')
+            .replace(new RegExp(`\\s*[·•|:–—-]\\s*${COUNT}\\s*\\+?\\s*${COUNT_WORDS}\\s*$`, 'i'), '')
+            .replace(new RegExp(`([^\\d\\s+-])\\s*${COUNT}\\s*${COUNT_WORDS}?\\s*$`, 'i'), '$1')
+            .trim()
+    }
+    return s.replace(/[,;:|•·]+$/, '').trim()
+}
+
 export function normalizeTagText(label: string): string {
     return label
         .normalize('NFD').replace(/[̀-ͯ]/g, '')
@@ -273,7 +303,10 @@ export function normalizeTagText(label: string): string {
  * Retourne null si ce n'est pas un vrai tag.
  */
 export function tagKey(label: string, custom: Record<string, string> = {}): string | null {
-    let k = normalizeTagText(label)
+    const cleaned = cleanTagLabel(label)
+    // "18+" garde un sens (contenu adulte) : on lui donne une clé lisible
+    const adult = /^(\d{2})\s*\+$/.exec(cleaned)
+    let k = adult ? `${adult[1]} plus` : normalizeTagText(cleaned)
     if (k === '' || k.length > 40 || /^\d+$/.test(k) || JUNK_TAGS.has(k)) return null
     // Les fusions de l'utilisateur passent en premier, puis les synonymes intégrés
     return custom[k] ?? BUILTIN_SYNONYMS[k] ?? k

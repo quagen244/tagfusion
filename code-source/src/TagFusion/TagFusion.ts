@@ -24,12 +24,12 @@ import { Details, detectEngine, Engine, engineByName, Fetcher, ListingItem } fro
 import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
 import {
-    decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
-    mapLimit, safeDate, safeEncode, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, titleKey
+    cleanTagLabel, decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
+    mapLimit, safeDate, safeEncode, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, tagKey, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.2.0',
+    version: '1.2.1',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -403,8 +403,8 @@ export class TagFusion extends Source {
                 const first = u.label.normalize('NFD').charAt(0).toUpperCase()
                 const letter = /[A-Z]/.test(first) ? first : 'other'
                 const list = byLetter.get(letter) ?? []
-                const count = Object.keys(u.sites).length
-                list.push(App.createTag({ id: tagIdOf(u.key), label: count > 1 ? `${u.label} (${count})` : u.label }))
+                // Libellé seul, sans aucun chiffre ajouté (les nombres prêtaient à confusion)
+                list.push(App.createTag({ id: tagIdOf(u.key), label: cleanTagLabel(u.label) || u.label }))
                 byLetter.set(letter, list)
             }
             for (const [letter, tags] of [...byLetter.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
@@ -438,8 +438,10 @@ export class TagFusion extends Source {
     private async doSearch(query: SearchRequest, metadata: unknown): Promise<PagedResults> {
         const unified = await this.store.unified()
         const inc = query.includedTags ?? []
-        const included = inc.map(t => keyOfTagId(t.id)).filter((k): k is string => k !== null)
-        const excluded = (query.excludedTags ?? []).map(t => keyOfTagId(t.id)).filter((k): k is string => k !== null)
+        // tagKey() nettoie aussi les anciens tags qui contenaient un nombre ("romance 123" -> "romance")
+        const toKey = (id: string): string | null => { const k = keyOfTagId(id); return k === null ? null : (tagKey(k) ?? k) }
+        const included = [...new Set(inc.map(t => toKey(t.id)).filter((k): k is string => k !== null))]
+        const excluded = [...new Set((query.excludedTags ?? []).map(t => toKey(t.id)).filter((k): k is string => k !== null))]
         const onlySites = inc.map(t => siteOfTagId(t.id)).filter((k): k is string => k !== null)
         const title = (query.title ?? '').trim()
         await this.debug(`recherche lancée : ${included.length} tag(s), titre « ${title} », page suivante : ${metadata ? 'oui' : 'non'}`)
@@ -614,7 +616,7 @@ export class TagFusion extends Source {
             const key = await this.store.keyFor(t.label)
             if (!key || ids.has(key)) continue
             ids.add(key)
-            tags.push(App.createTag({ id: tagIdOf(key), label: t.label }))
+            tags.push(App.createTag({ id: tagIdOf(key), label: cleanTagLabel(t.label) }))
         }
 
         return App.createSourceManga({

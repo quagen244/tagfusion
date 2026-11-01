@@ -39,11 +39,20 @@ const GENERIC_DETAILS = `<html><head><meta property="og:image" content="https://
 <a href="https://libre.test/series/office-love/chapter-1/">Chapter 1</a></main>
 </body></html>`
 
+// Site qui colle le nombre d'œuvres aux tags
+const COUNT_HOME = `<html><body><div class="wp-manga"></div>
+<div class="page-item-detail"><div class="post-title"><h3><a href="https://compte.test/manga/love-code/">Love Code</a></h3></div><img src="https://compte.test/c/l.jpg"></div></body></html>`
+const COUNT_DETAILS = `<html><body class="wp-manga"><div class="post-title"><h1>Love Code</h1></div>
+<div class="genres-content"><a href="https://compte.test/manga-genre/romance/">Romance <span class="count">(1 234)</span></a><a href="https://compte.test/manga-genre/action/">Action 56</a></div>
+<ul class="tag-list"><li>Revenge [12]</li><li>Office Workers · 3</li></ul></body></html>`
+
 const PAGES: Record<string, string> = {
     'https://madara.test/': MADARA_HOME,
     'https://madara.test/manga/solo-quest/': MADARA_DETAILS,
     'https://libre.test/': GENERIC_HOME,
-    'https://libre.test/series/office-love/': GENERIC_DETAILS
+    'https://libre.test/series/office-love/': GENERIC_DETAILS,
+    'https://compte.test/': COUNT_HOME,
+    'https://compte.test/manga/love-code/': COUNT_DETAILS
 }
 
 // --- Fausse app Paperback ------------------------------------------------------------
@@ -152,6 +161,30 @@ async function main(): Promise<void> {
     assert.equal(new Set(r1.results.map((m: any) => m.mangaId)).size, r1.results.length)
     assert.ok(allIds.every((id: string) => /^[A-Za-z0-9._-]+$/.test(id)))
     console.log('✓ Identifiants uniques et sans caractères spéciaux')
+
+    // --- Site qui affiche le nombre d'œuvres dans ses tags ---
+    await fresh.store.setSites(['https://madara.test', 'https://libre.test', 'https://compte.test'])
+    const countId = encodeMangaId('compte.test', 'https://compte.test/manga/love-code/')
+    const lc = await fresh.getMangaDetails(countId)
+    const lcTags = lc.mangaInfo.tags[0].tags
+    assert.deepEqual(lcTags.map((t: any) => t.label).sort(), ['Action', 'Office Workers', 'Revenge', 'Romance'])
+    assert.ok(lcTags.every((t: any) => !/\d/.test(t.id) && !/\d/.test(t.label)), 'aucun chiffre dans les tags')
+    console.log('✓ Fiche avec nombres d\'œuvres : tags propres (Romance, Action, Revenge, Office Workers)')
+
+    await sleep(1600)
+    const tagScreen = (await fresh.getSearchTags()).flatMap((s: any) => s.tags)
+    assert.ok(!tagScreen.some((t: any) => t.id.startsWith('tag_') && /\d/.test(t.label)), 'aucun chiffre dans la liste des tags')
+    const u2 = await fresh.store.unified()
+    assert.deepEqual(Object.keys(u2.romance.sites).sort(), ['compte.test', 'madara.test'])
+    console.log('✓ Liste des tags sans aucun chiffre, « Romance » réunit les deux sites')
+
+    // Cliquer sur « Revenge » : les 3 mangas de 3 sites, pas seulement la source qui affiche des nombres
+    const r4 = await fresh.getSearchResults({ includedTags: [{ id: tagIdOf('revenge'), label: 'Revenge' }], excludedTags: [] }, undefined)
+    assert.deepEqual(r4.results.map((m: any) => m.title).sort(), ['Love Code', 'Office Love', 'Solo Quest'])
+    // Un ancien tag avec nombre, encore en mémoire dans l'app, mène au même résultat
+    const r5 = await fresh.getSearchResults({ includedTags: [{ id: tagIdOf('revenge 12'), label: 'Revenge [12]' }], excludedTags: [] }, undefined)
+    assert.deepEqual(r5.results.map((m: any) => m.title).sort(), ['Love Code', 'Office Love', 'Solo Quest'])
+    console.log('✓ Clic sur un tag : toutes les sources, même depuis un ancien tag avec nombre')
 
     // --- Chapitres de la fiche Madara ---
     const chapters = await fresh.getChapters(madaraId)

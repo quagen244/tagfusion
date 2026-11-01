@@ -1,7 +1,7 @@
 import { CheerioAPI, Cheerio, Element } from 'cheerio'
 import { EngineName, SiteTag } from './Store'
 import {
-    absoluteUrl, hostOf, looksLikeChapterUrl, looksLikeMangaUrl, looksLikeTagUrl, normalizeTagText,
+    absoluteUrl, cleanTagLabel, hostOf, looksLikeChapterUrl, looksLikeMangaUrl, looksLikeTagUrl, normalizeTagText,
     pagedUrl, parseChapterNumber, parseDate, pickImageSrc
 } from './Utils'
 
@@ -152,10 +152,12 @@ function zoneTags($: CheerioAPI, pageUrl: string, base: string): SiteTag[] {
 function mergeTags(a: SiteTag[], b: SiteTag[]): SiteTag[] {
     const byKey = new Map<string, SiteTag>()
     for (const t of [...a, ...b]) {
-        const k = normalizeTagText(t.label)
+        // Sans le nombre d'œuvres que certains sites collent au tag : "Romance (1 234)" -> "Romance"
+        const label = cleanTagLabel(t.label)
+        const k = normalizeTagText(label)
         if (!k) continue
         const prev = byKey.get(k)
-        if (!prev) byKey.set(k, { ...t })
+        if (!prev) byKey.set(k, { ...t, label })
         else {
             if (!prev.url && t.url) prev.url = t.url
             if (!prev.filter && t.filter) prev.filter = t.filter

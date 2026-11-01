@@ -1,5 +1,5 @@
 import { SourceStateManager } from '@paperback/types'
-import { normalizeTagText, parseCustomMerges, prettyLabel, siteIdOf, tagKey } from './Utils'
+import { cleanTagLabel, normalizeTagText, parseCustomMerges, prettyLabel, siteIdOf, tagKey } from './Utils'
 
 export type EngineName = 'madara' | 'themesia' | 'generic'
 
@@ -168,7 +168,8 @@ export class Store {
             let added = 0
             let changed = false
             for (const t of linked) {
-                const label = t.label.replace(/\s+/g, ' ').trim()
+                // Sans le nombre d'œuvres que certains sites collent au tag
+                const label = cleanTagLabel(t.label)
                 const norm = normalizeTagText(label)
                 if (!norm || tagKey(label) === null) continue
                 const prev = bucket[norm]
@@ -214,7 +215,7 @@ export class Store {
 
     /** Enregistre (ou met à jour) un manga et tous ses tags. Retourne true si ses tags ont changé. */
     async indexManga(mangaId: string, entry: Omit<IndexedManga, 'at'>): Promise<boolean> {
-        const labels = [...new Set(entry.l.map(l => l.replace(/\s+/g, ' ').trim()).filter(l => tagKey(l) !== null))]
+        const labels = [...new Set(entry.l.map(cleanTagLabel).filter(l => tagKey(l) !== null))]
         return this.serial(async () => {
             const index = await this.getIndex(true)
             const prev = index[mangaId]
@@ -280,7 +281,7 @@ export class Store {
                 if (key === null) continue
                 const u = out[key] ?? (out[key] = { key, label: prettyLabel(key), sites: {}, indexed: 0 })
                 if (!u.sites[siteId]) u.sites[siteId] = t
-                vote(key, t.label)
+                vote(key, cleanTagLabel(t.label))
             }
         }
         for (const m of Object.values(index)) {
@@ -291,7 +292,7 @@ export class Store {
                 seen.add(key)
                 const u = out[key] ?? (out[key] = { key, label: prettyLabel(key), sites: {}, indexed: 0 })
                 u.indexed++
-                vote(key, l)
+                vote(key, cleanTagLabel(l))
             }
         }
         // Le libellé affiché = la forme la plus fréquente
