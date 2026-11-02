@@ -8,7 +8,7 @@
     "typecheck": "tsc --noEmit",
     "bundle": "npx paperback bundle",
     "serve": "npx paperback serve",
-    "test": "npx tsx tests/utils.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/cloudflare.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/tags.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/chapters.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/robustness.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/sites.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/pages.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/home.test.ts"
+    "test": "npx tsx tests/utils.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/cloudflare.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/tags.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/chapters.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/robustness.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/sites.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/pages.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/home.test.ts && npx tsx --tsconfig tests/tsconfig.json tests/multitag.test.ts"
   },
   "license": "GPL-3.0-or-later",
   "devDependencies": {
