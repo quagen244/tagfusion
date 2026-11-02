@@ -56,6 +56,11 @@ export interface Engine {
 
 // --- Outils communs ------------------------------------------------------------
 
+/** Liens qui ne sont pas des genres : artistes, groupes, personnages, parodies, langues… */
+const NON_GENRE_PATH = /\/(artists?|authors?|auteurs?|groups?|circles?|parod(?:y|ies)|characters?|personnages?|languages?|langues?|uploaders?|users?|members?|scanlators?|translators?|traducteurs?|teams?|magazines?|publishers?|studios?)\//i
+const NON_GENRE_QUERY = /[?&](?:q|s|query|search|tag)=(?:artist|author|group|circle|parody|character|language|uploader)(?::|%3a)/i
+const NON_GENRE_LABEL = /^(artist|author|group|circle|parody|character|language|uploader)s?\s*:/i
+
 const NAV_SCOPE = 'header, nav, footer, aside, .menu, .navbar, .nav-menu, .main-menu, .sub-menu, .dropdown-menu, .sidebar, .widget, #menu, .footer, .header'
 
 function clean(s: string | undefined): string {
@@ -85,6 +90,8 @@ function genericTagLinks($: CheerioAPI, base: string, skipNav: boolean, scope?: 
     $(scope ? `${scope} a[href]` : 'a[href]').each((_, el) => {
         const url = absoluteUrl($(el).attr('href'), base)
         if (!url || !sameHost(url, base) || !looksLikeTagUrl(url)) return
+        // Artistes, groupes, personnages, parodies, langues : pas des tags de genre
+        if (NON_GENRE_PATH.test(url) || NON_GENRE_QUERY.test(url)) return
         if (skipNav && inNav($, el)) return
         // "Romance (1234)" -> "Romance"
         const label = clean($(el).attr('title') && clean($(el).text()) === '' ? $(el).attr('title') : $(el).text())
@@ -118,6 +125,10 @@ function zoneTags($: CheerioAPI, pageUrl: string, base: string): SiteTag[] {
     const push = (rawLabel: string, href?: string): void => {
         const label = clean(rawLabel).replace(/^#/, '').replace(/\s*[([]?\d[\d,.\s]*[)\]]?\s*$/, '').replace(/[,;|•·]+$/, '').trim()
         if (!label || label.length > 40 || /:$/.test(label)) return
+        if (NON_GENRE_LABEL.test(label)) return
+        // Un lien vers un artiste, un groupe, un personnage… n'est pas un tag de genre
+        const target = href ? absoluteUrl(href, pageUrl) : null
+        if (target && sameHost(target, base) && (NON_GENRE_PATH.test(target) || NON_GENRE_QUERY.test(target))) return
         const norm = normalizeTagText(label)
         if (!norm || seen.has(norm)) return
         seen.add(norm)
@@ -144,7 +155,9 @@ function zoneTags($: CheerioAPI, pageUrl: string, base: string): SiteTag[] {
             // On ne garde que les "feuilles" (pas les éléments qui contiennent d'autres étiquettes)
             if (chip.find('a, li, span, button').length > 0) return
             chips++
-            push(chip.text(), c.name === 'a' ? chip.attr('href') : undefined)
+            // L'adresse du tag : le lien lui-même, ou le lien qui contient l'étiquette (<a><span>nom</span></a>)
+            const link = c.name === 'a' ? chip : chip.closest('a[href]')
+            push(chip.text(), link.length ? link.attr('href') : undefined)
         })
         if (chips === 0) for (const part of clean(zone.text()).split(/\s*[,;|•·]\s*/)) push(part)
     })

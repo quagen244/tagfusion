@@ -724,6 +724,11 @@ export async function galleryPages(f: Fetcher, $: CheerioAPI, url: string, html 
     const sampleFull: (string | undefined)[] = []
     for (const i of samples) {
         try { sampleFull.push(await fullOf((thumbs[i] as { url: string }).url)) } catch { sampleFull.push(undefined) }
+        // Liste complète des pages fournie par le site lui-même (type nhentai) : vérifiée sur la 1re page
+        if (sampleFull.length === 1) {
+            const fromData = pagesFromGalleryData(html, sampleFull[0], first.n)
+            if (fromData) return fromData
+        }
     }
     const rule = thumbToFullRule(samples.map(i => (thumbs[i] as { thumb: string }).thumb), sampleFull)
     if (rule) {
@@ -748,11 +753,16 @@ export async function galleryPages(f: Fetcher, $: CheerioAPI, url: string, html 
     // Les pages déjà ouvertes pour la vérification ne sont pas redemandées
     const known = new Map<string, string>()
     samples.forEach((i, k) => { const full = sampleFull[k]; if (full) known.set((thumbs[i] as { url: string }).url, full) })
+    // Limites : au plus 120 pages ouvertes et 25 secondes ; au-delà, la miniature garde la place
+    // (le chapitre s'ouvre toujours, au lieu de charger sans fin)
+    const started = Date.now()
+    let opened = 0
     const pages = await mapLimitSimple(slots.slice(0, 500), 4, async slot => {
         const hit = known.get(slot.url)
         if (hit) return hit
-        // Deuxième chance (le réseau réessaie déjà lui-même), puis la miniature pour garder la place et l'ordre
         for (let attempt = 0; attempt < 2; attempt++) {
+            if (Date.now() - started > 25000 || opened >= 120) break
+            opened++
             try { const full = await fullOf(slot.url); if (full) return full } catch { /* nouvel essai */ }
         }
         return slot.thumb || undefined
@@ -796,10 +806,42 @@ export function orderPages(pages: string[]): string[] {
     return pages.map((p, i) => ({ p, n: nums[i] as number })).sort((a, b) => a.n - b.n).map(x => x.p)
 }
 
+/**
+ * Liste des pages donnée par le site dans ses données (type nhentai : identifiant du dossier d'images
+ * et type de chaque page, j/p/g/w). Construite à partir de la vraie adresse de la 1re page, et retenue
+ * seulement si elle la reproduit exactement.
+ */
+export function pagesFromGalleryData(html: string, firstFull: string | undefined, firstNumber: number): string[] | null {
+    if (!firstFull || !html) return null
+    const text = html.replace(/\\u([0-9a-fA-F]{4})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16))).replace(/\\"/g, '"').replace(/\\\//g, '/')
+    const media = /"media_id"\s*:\s*"?(\d+)"?/.exec(text)?.[1]
+    const pagesBlock = /"pages"\s*:\s*\[([^\]]*)\]/.exec(text)?.[1]
+    if (!media || !pagesBlock) return null
+    const EXT: Record<string, string> = { j: 'jpg', p: 'png', g: 'gif', w: 'webp', a: 'avif' }
+    const types = [...pagesBlock.matchAll(/"t"\s*:\s*"(\w)"/g)].map(m => EXT[m[1] as string] ?? '')
+    if (types.length < 1 || types.some(t => !t)) return null
+    const m = new RegExp(`^(.*/${media}/)(\\d+)\\.([a-z0-9]+)(\\?.*)?$`, 'i').exec(firstFull)
+    if (!m) return null
+    const prefix = m[1] as string
+    const firstFileNumber = Number(m[2])
+    const pages = types.map((ext, i) => `${prefix}${firstFileNumber + i}.${ext}`)
+    // Vérification : la 1re page construite doit être exactement la vraie
+    if (pages[0] !== firstFull.replace(/[?#].*$/, '') || firstFileNumber < 0 || firstNumber < 0) return null
+    return pages
+}
+
 /** Règles miniature -> grande image, combinables ; retenue seulement si elle reproduit tous les exemples */
 function thumbToFullRule(thumbs: string[], fulls: (string | undefined)[]): ((t: string) => string) | null {
     if (fulls.some(x => !x) || thumbs.some(x => !x)) return null
+    // Miniatures et grandes images sur deux serveurs différents (t3.site -> i5.site) : correspondance apprise
+    const originOf = (u: string): string => (/^https?:\/\/[^/]+/i.exec(u) ?? [''])[0]
+    const tOrigins = [...new Set(thumbs.map(originOf))]
+    const fOrigins = [...new Set((fulls as string[]).map(originOf))]
+    const learned: ((t: string) => string)[] = tOrigins.length === 1 && fOrigins.length === 1 && tOrigins[0] !== fOrigins[0]
+        ? [t => (originOf(t) === tOrigins[0] ? (fOrigins[0] as string) + t.slice((tOrigins[0] as string).length) : t)]
+        : []
     const atoms: ((t: string) => string)[] = [
+        ...learned,
         t => t.replace(/\/\/t(\d*)\./, '//i$1.'),                                  // t3.site -> i3.site
         t => t.replace(/(\d+)t(\.[a-z0-9]+)(\?|$)/i, '$1$2$3'),                   // 12t.jpg -> 12.jpg
         t => t.replace(/\/thumb(?:nail)?s?\//i, '/'),                            // /thumbnail/ -> /

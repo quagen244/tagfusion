@@ -134,9 +134,9 @@ async function main(): Promise<void> {
     const other: any = new TagFusion({ load })
     const imgReq = await other.requestManager.interceptor.interceptRequest({ url: 'https://cdn.flaky-img.test/a/1/2.jpg', method: 'GET', headers: {}, cookies: [] })
     assert.equal(imgReq.headers['referer'], 'https://flaky.test/')
-    assert.match(imgReq.headers['accept'], /^image\//)
+    assert.equal(imgReq.headers['accept'], undefined, 'pas d\'en-tête Accept imposé (l\'app choisit les formats qu\'elle sait afficher)')
     assert.equal(imgReq.headers['user-agent'], 'UA-Paperback')
-    console.log('✓ Images : site d\'origine retrouvé par un autre exemplaire de l\'extension, en-têtes d\'image envoyés')
+    console.log('✓ Images : site d\'origine retrouvé par un autre exemplaire de l\'extension')
 
     // Serveur d'images jamais vu, mais même domaine qu'un site : Referer du site
     const fresh: any = new TagFusion({ load })

@@ -30,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.9.2',
+    version: '1.9.3',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -62,6 +62,8 @@ interface SearchMeta {
 }
 
 const DISCOVERY_BUDGET_MS = 10000
+/** Nombre maximum de tags affichés sur l'écran de recherche */
+const MAX_SEARCH_TAGS = 500
 /** Recherche : fiches lues au plus par appel, et temps maximum par appel (premier / suivants) */
 const SEARCH_READS = 40
 const SEARCH_TIME_FIRST = 15000
@@ -104,10 +106,6 @@ class SiteInterceptor implements SourceInterceptor {
         }
         if (!headers['referer'] && !headers['Referer']) {
             try { headers['referer'] = await this.referer(request.url) } catch { /* pas de Referer */ }
-        }
-        // Images : en-tête Accept d'un navigateur (certains serveurs d'images l'exigent)
-        if (!headers['accept'] && !headers['Accept'] && /\.(?:jpe?g|png|webp|gif|avif|bmp|jfif)(?:[?#]|$)/i.test(request.url)) {
-            headers['accept'] = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
         }
         // Il faut réassigner l'objet pour que l'app voie la modification
         request.headers = headers
@@ -577,7 +575,13 @@ export class TagFusion extends Source {
             // Sites jamais analysés : découverte de leurs tags, attendue, avec une limite de temps
             await this.discoverAll(false, Date.now() + DISCOVERY_BUDGET_MS)
 
+            // Écran des tags : tous les tags, mais plafonnés (une liste de plusieurs milliers de tags fait planter
+            // l'écran) en gardant les plus utiles : d'abord ceux qui ont une page sur un site, puis les plus fréquents
             const unified = Object.values(await this.store.unified())
+                .map(u => ({ u, score: Object.values(u.sites).filter(t => !!t.url).length * 5 + u.indexed }))
+                .sort((a, b) => b.score - a.score || a.u.label.localeCompare(b.u.label))
+                .slice(0, MAX_SEARCH_TAGS)
+                .map(x => x.u)
                 .sort((a, b) => a.label.localeCompare(b.label))
             const info = await this.store.getSiteInfo()
 
@@ -1092,7 +1096,7 @@ export class TagFusion extends Source {
     override async getChapterDetails(mangaId: string, chapterId: string): Promise<ChapterDetails> {
         const { siteId } = decodeMangaId(mangaId)
         const base = await this.baseOf(siteId)
-        const cacheKey = `${siteId}|${chapterId}`
+        const cacheKey = `v2|${siteId}|${chapterId}`
         // Paperback redemande souvent le même chapitre (préchargement, retour en arrière) :
         // on renvoie exactement la même liste pendant 30 minutes, pour un ordre et un nombre de pages stables
         const cached = await this.store.getCachedPages(cacheKey).catch(() => undefined)
