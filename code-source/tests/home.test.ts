@@ -119,6 +119,19 @@ async function main(): Promise<void> {
     assert.ok(legacy.results.length >= 1)
     console.log('✓ Ancien identifiant de rangée : toujours compris')
 
+    // --- Écran des tags : pas de section « # », pas de faux tags ---
+    await src.store.addTags('aaa.test', ['+22 more pages', '1', '» Prev', '(Shoujo)', '3D', 'Show More', '12 pages', 'Vanilla']
+        .map(l => ({ label: l, url: `https://aaa.test/tag/${encodeURIComponent(l)}/` })))
+    const screen = await src.getSearchTags()
+    const letterSections = screen.filter((x: any) => x.id.startsWith('letter_'))
+    assert.ok(!screen.some((x: any) => x.label === '#'), 'pas de section #')
+    assert.ok(letterSections.every((x: any) => /^[A-Z]$/.test(x.label)), 'seulement des lettres')
+    const all = letterSections.flatMap((x: any) => x.tags.map((t: any) => t.label))
+    for (const bad of ['+22 more pages', '1', '» Prev', 'Show More', '12 pages', '3D']) assert.ok(!all.includes(bad), `« ${bad} » ne doit pas apparaître`)
+    assert.ok(letterSections.find((x: any) => x.label === 'S').tags.some((t: any) => t.label === 'Shoujo'), '« (Shoujo) » rangé sous S, sans parenthèses')
+    assert.ok(letterSections.find((x: any) => x.label === 'V').tags.some((t: any) => t.label === 'Vanilla'))
+    console.log('✓ Écran des tags : plus de section « # », faux tags retirés, « (Shoujo) » rangé sous S')
+
     // --- Aucune requête après la réponse ---
     requests.length = 0
     await src.getHomePageSections(() => undefined)

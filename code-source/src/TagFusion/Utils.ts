@@ -270,8 +270,17 @@ export const BUILTIN_SYNONYMS: Record<string, string> = {
 const JUNK_TAGS = new Set([
     'all', 'tous', 'toutes', 'more', 'plus', 'see all', 'view all', 'voir tout', 'home', 'accueil',
     'next', 'previous', 'prev', 'suivant', 'precedent', 'page', 'genres', 'genre', 'tags', 'tag',
-    'categories', 'category', 'menu', 'search', 'recherche', 'latest', 'popular', 'new', 'hot'
+    'categories', 'category', 'menu', 'search', 'recherche', 'latest', 'popular', 'new', 'hot',
+    // restes de navigation ou de boutons aspirés avec les tags
+    'more pages', 'show more', 'see more', 'load more', 'read more', 'show all', 'showing', 'show less',
+    'previous page', 'next page', 'first', 'last', 'top', 'back', 'retour', 'random', 'aleatoire',
+    'login', 'log in', 'register', 'sign in', 'sign up', 'connexion', 'inscription', 'upload', 'contact',
+    'dmca', 'privacy', 'terms', 'faq', 'discord', 'twitter', 'facebook', 'reddit', 'patreon', 'rss',
+    'bookmark', 'bookmarks', 'favorites', 'favoris', 'history', 'historique', 'settings', 'download', 'telecharger'
 ])
+
+/** Vrais tags qui commencent par un chiffre (gardés sur les fiches ; tous les autres sont des restes de pages) */
+const KEEP_NON_ALPHA = new Set(['2d', '3d', '4 koma', '18 plus'])
 
 /** "Sci-Fi ", "sci‑fi", "Science Fiction" -> "sci fi" (forme comparable) */
 /** Mots qui accompagnent parfois le nombre d'œuvres : "Romance (1 234 mangas)" */
@@ -301,7 +310,9 @@ export function cleanTagLabel(raw: string): string {
             .replace(new RegExp(`([^\\d\\s+-])\\s*${COUNT}\\s*${COUNT_WORDS}?\\s*$`, 'i'), '$1')
             .trim()
     }
+    // Guillemets, parenthèses ou crochets autour du nom : « (Shoujo) », "Isekai" -> Shoujo, Isekai
     return s.replace(/[,;:|•·]+$/, '').trim()
+        .replace(/^[\s([{«"'“‘<]+/, '').replace(/[\s)\]}»"”’>]+$/, '').trim()
 }
 
 export function normalizeTagText(label: string): string {
@@ -325,6 +336,8 @@ export function tagKey(label: string, custom: Record<string, string> = {}): stri
     const adult = /^(\d{2})\s*\+$/.exec(cleaned)
     let k = adult ? `${adult[1]} plus` : normalizeTagText(cleaned)
     if (k === '' || k.length > 40 || /^\d+$/.test(k) || JUNK_TAGS.has(k)) return null
+    // Un tag commence par une lettre (« +22 more pages », « 1 », « » Prev » ne sont pas des tags)
+    if (!/^[a-z]/.test(k) && !KEEP_NON_ALPHA.has(k)) return null
     // Les fusions de l'utilisateur passent en premier, puis les synonymes intégrés
     return custom[k] ?? BUILTIN_SYNONYMS[k] ?? k
 }

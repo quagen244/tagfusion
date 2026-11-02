@@ -30,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.9.0',
+    version: '1.9.1',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -580,15 +580,16 @@ export class TagFusion extends Source {
             // Une section par lettre pour que la liste reste lisible
             const byLetter = new Map<string, Tag[]>()
             for (const u of unified) {
-                const first = u.label.normalize('NFD').charAt(0).toUpperCase()
-                const letter = /[A-Z]/.test(first) ? first : 'other'
+                // Rangé par la première lettre du nom nettoyé ; pas de section « # » (elle ne contenait que des restes de pages)
+                const letter = u.key.charAt(0).toUpperCase()
+                if (!/^[A-Z]$/.test(letter)) continue
                 const list = byLetter.get(letter) ?? []
                 // Libellé seul, sans aucun chiffre ajouté (les nombres prêtaient à confusion)
                 list.push(App.createTag({ id: tagIdOf(u.key), label: cleanTagLabel(u.label) || u.label }))
                 byLetter.set(letter, list)
             }
             for (const [letter, tags] of [...byLetter.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-                if (tags.length) sections.push(App.createTagSection({ id: `letter_${letter}`, label: letter === 'other' ? '#' : letter, tags }))
+                if (tags.length) sections.push(App.createTagSection({ id: `letter_${letter}`, label: letter, tags }))
             }
             await this.debug(`écran de recherche : ${sections.length} section(s), ${unified.length} tag(s) envoyés à l'app`)
             return sections
