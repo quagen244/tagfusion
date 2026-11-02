@@ -351,6 +351,52 @@ export class Store {
         await this.state.store('tf_repos_imported_at', t)
     }
 
+    // --- Serveurs d'images -> site d'origine (en-tête Referer), gardé entre les sessions ---
+
+    private imgRef?: { data: Record<string, string>, at: number }
+
+    async getImageReferers(): Promise<Record<string, string>> {
+        if (!this.imgRef || Date.now() - this.imgRef.at > 10000) {
+            this.imgRef = { data: await this.load<Record<string, string>>('tf_image_referers'), at: Date.now() }
+        }
+        return this.imgRef.data
+    }
+
+    async addImageReferers(map: Record<string, string>): Promise<void> {
+        const entries = Object.entries(map)
+        if (entries.length === 0) return
+        const cur = await this.getImageReferers()
+        if (entries.every(([h, b]) => cur[h] === b)) return
+        await this.serial(async () => {
+            const data = await this.load<Record<string, string>>('tf_image_referers')
+            for (const [h, b] of entries) data[h] = b
+            // Au plus 300 serveurs gardés
+            const keys = Object.keys(data)
+            for (const k of keys.slice(0, Math.max(0, keys.length - 300))) delete data[k]
+            await this.state.store('tf_image_referers', data)
+            this.imgRef = { data, at: Date.now() }
+        })
+    }
+
+    // --- Pages des chapitres déjà chargés (même résultat à chaque ouverture) ---------
+
+    async getCachedPages(key: string): Promise<{ p: string[], at: number } | undefined> {
+        const all = await this.load<Record<string, { p: string[], at: number }>>('tf_pages_cache')
+        const hit = all[key]
+        return hit && Array.isArray(hit.p) && hit.p.length ? hit : undefined
+    }
+
+    async setCachedPages(key: string, pages: string[]): Promise<void> {
+        await this.serial(async () => {
+            const all = await this.load<Record<string, { p: string[], at: number }>>('tf_pages_cache')
+            all[key] = { p: pages, at: Date.now() }
+            // Les 40 chapitres les plus récents
+            const keys = Object.keys(all).sort((a, b) => (all[a]?.at ?? 0) - (all[b]?.at ?? 0))
+            for (const k of keys.slice(0, Math.max(0, keys.length - 40))) delete all[k]
+            await this.state.store('tf_pages_cache', all)
+        })
+    }
+
     // --- Remise à zéro ----------------------------------------------------------
 
     /**
@@ -359,7 +405,7 @@ export class Store {
      */
     async resetAll(full: boolean): Promise<void> {
         await this.serial(async () => {
-            for (const k of [K_RAW, K_INDEX, K_INFO]) await this.state.store(k, {})
+            for (const k of [K_RAW, K_INDEX, K_INFO, 'tf_pages_cache']) await this.state.store(k, {})
             await this.state.store(K_CF, [])
             await this.state.store('tf_debug', [])
             await this.state.store('tf_repos_imported_at', 0)

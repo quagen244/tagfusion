@@ -20,7 +20,7 @@ import {
     TagSection
 } from '@paperback/types'
 import { CheerioAPI } from 'cheerio'
-import { galleryPages, parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
+import { galleryPages, orderPages, parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
 import { Details, detectEngine, Engine, engineByName, Fetcher, findNextPageUrl, ListingItem, pageCandidates } from './Engines'
 import { buildSettings } from './Settings'
 import { SiteTag, Store, UnifiedTag } from './Store'
@@ -30,7 +30,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.7.0',
+    version: '1.8.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -76,7 +76,7 @@ const SETTINGS_BUDGET_MS = 25000
  */
 class SiteInterceptor implements SourceInterceptor {
     constructor(
-        private readonly referers: Map<string, string>,
+        private readonly referer: (url: string) => Promise<string>,
         private readonly userAgent: () => Promise<string | undefined>
     ) {}
 
@@ -87,8 +87,11 @@ class SiteInterceptor implements SourceInterceptor {
             if (ua) headers['user-agent'] = ua
         }
         if (!headers['referer'] && !headers['Referer']) {
-            const origin = (/^https?:\/\/[^/]+/i.exec(request.url) ?? [''])[0]
-            headers['referer'] = this.referers.get(hostOf(request.url)) ?? `${origin}/`
+            try { headers['referer'] = await this.referer(request.url) } catch { /* pas de Referer */ }
+        }
+        // Images : en-tête Accept d'un navigateur (certains serveurs d'images l'exigent)
+        if (!headers['accept'] && !headers['Accept'] && /\.(?:jpe?g|png|webp|gif|avif|bmp|jfif)(?:[?#]|$)/i.test(request.url)) {
+            headers['accept'] = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
         }
         // Il faut réassigner l'objet pour que l'app voie la modification
         request.headers = headers
@@ -114,8 +117,26 @@ export class TagFusion extends Source {
         // Pas trop vite : un rythme élevé déclenche lui-même les protections Cloudflare
         requestsPerSecond: 5,
         requestTimeout: 20000,
-        interceptor: new SiteInterceptor(this.imageReferers, () => this.userAgent())
+        interceptor: new SiteInterceptor(url => this.refererFor(url), () => this.userAgent())
     })
+
+    /**
+     * Site d'origine à annoncer pour une requête (en-tête Referer). Beaucoup de serveurs d'images
+     * refusent une image sans lui. Ordre : mémoire de cet exemplaire, mémoire enregistrée (partagée
+     * avec les autres exemplaires et les sessions suivantes), site de même domaine, sinon l'adresse elle-même.
+     */
+    private async refererFor(url: string): Promise<string> {
+        const host = hostOf(url)
+        const local = this.imageReferers.get(host)
+        if (local) return local
+        const saved = (await this.store.getImageReferers())[host]
+        if (saved) { this.imageReferers.set(host, saved); return saved }
+        const root = host.split('.').slice(-2).join('.')
+        const sites = this.store.sitesSync().length ? this.store.sitesSync() : await this.store.getSites()
+        const sameDomain = sites.find(b => { const h = siteIdOf(b); return h === host || h.split('.').slice(-2).join('.') === root })
+        if (sameDomain) return `${sameDomain}/`
+        return `${(/^https?:\/\/[^/]+/i.exec(url) ?? [''])[0]}/`
+    }
 
     /** User-Agent du navigateur intégré de Paperback (celui qui résout le défi Cloudflare) */
     private async userAgent(): Promise<string | undefined> {
@@ -141,9 +162,25 @@ export class TagFusion extends Source {
             const cached = this.htmlCache.get(url)
             if (cached && Date.now() - cached.at < 60000) return cached.html
         }
-        const response = await this.requestManager.schedule(App.createRequest({ url, method, headers, ...(data !== undefined ? { data } : {}) }), 1)
-        const html = response.data ?? ''
         const host = hostOf(url)
+        // Jusqu'à 3 essais pour les erreurs passagères (coupure, délai dépassé, serveur surchargé),
+        // jamais pour une page absente (404) ou un blocage Cloudflare
+        let response: Response | undefined
+        let lastError: unknown
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const r = await this.requestManager.schedule(App.createRequest({ url, method, headers, ...(data !== undefined ? { data } : {}) }), 1)
+                const transient = r.status === 0 || r.status === 408 || r.status === 425 || r.status === 429 || r.status === 500 || r.status === 502 || r.status === 504
+                    || (r.status === 503 && !/cf-chl|challenge-platform|just a moment|cf_clearance/i.test(r.data ?? ''))
+                response = r
+                if (!transient) break
+            } catch (e) {
+                lastError = e
+                response = undefined
+            }
+        }
+        if (!response) throw lastError instanceof Error ? lastError : new Error(`${host} ne répond pas`)
+        const html = response.data ?? ''
         if ((response.status === 403 || response.status === 503) &&
             (/cf-chl|challenge-platform|just a moment|cf_clearance/i.test(html) || /cloudflare/i.test(String(response.headers?.['server'] ?? response.headers?.['Server'] ?? '')))) {
             const base = (await this.store.getSiteInfo())[host]?.base ?? (/^https?:\/\/[^/]+/i.exec(url) ?? [url])[0]
@@ -746,7 +783,16 @@ export class TagFusion extends Source {
         const { siteId, path } = decodeMangaId(mangaId)
         const url = (await this.baseOf(siteId)) + path
         this.detailsCache.delete(url) // toujours des infos fraîches quand on ouvre la fiche
-        const d = await this.fetchDetails(siteId, url)
+        let d: Details
+        try {
+            d = await this.fetchDetails(siteId, url)
+        } catch (e) {
+            // Le site ne répond pas : on ouvre quand même la fiche avec ce que l'index connaît
+            const known = await this.store.getIndexed(mangaId).catch(() => undefined)
+            if (!known) throw e
+            await this.debug(`fiche ${siteId} : site injoignable, fiche ouverte depuis l'index`)
+            d = { title: known.t, image: known.i, desc: '', author: '', artist: '', status: 'Unknown', altTitles: [], tags: known.l.map(l => ({ label: l, url: '' })) }
+        }
 
         const tags: Tag[] = []
         const ids = new Set<string>()
@@ -874,10 +920,20 @@ export class TagFusion extends Source {
     override async getChapterDetails(mangaId: string, chapterId: string): Promise<ChapterDetails> {
         const { siteId } = decodeMangaId(mangaId)
         const base = await this.baseOf(siteId)
-        const engine = await this.engineOf(siteId)
-        const pageUrl = engine.chapterPageUrl(base + decodeChapterId(chapterId))
+        const cacheKey = `${siteId}|${chapterId}`
+        // Paperback redemande souvent le même chapitre (préchargement, retour en arrière) :
+        // on renvoie exactement la même liste pendant 30 minutes, pour un ordre et un nombre de pages stables
+        const cached = await this.store.getCachedPages(cacheKey).catch(() => undefined)
+        if (cached && Date.now() - cached.at < 30 * 60000) {
+            await this.rememberImageHosts(cached.p, base)
+            return App.createChapterDetails({ id: chapterId, mangaId, pages: cached.p })
+        }
         let pages: string[] = []
+        let engineName = '?'
         try {
+            const engine = await this.engineOf(siteId)
+            engineName = engine.name
+            const pageUrl = engine.chapterPageUrl(base + decodeChapterId(chapterId))
             const html = await this.fetcher.get(pageUrl)
             const $p = this.fetcher.load(html)
             // Galerie (miniatures vers des pages de lecture) : images en taille réelle, jamais les miniatures
@@ -885,15 +941,31 @@ export class TagFusion extends Source {
             if (found.length < 2) found = engine.parsePages($p, html, pageUrl)
             // Vieux lecteurs "une image par page" : on suit les pages du chapitre
             if (found.length < 2) found = await universalPagesDeep(this.fetcher, $p, html, pageUrl)
-            pages = [...new Set(found.map(p => safeUrl(p, '')).filter(Boolean))]
-            await this.debug(`pages ${siteId} (${engine.name}) : ${pages.length} image(s)${pages[0] ? `, ex. ${pages[0].slice(0, 70)}` : ''}`)
+            pages = orderPages([...new Set(found.map(p => safeUrl(p, '')).filter(Boolean))])
+            await this.debug(`pages ${siteId} (${engineName}) : ${pages.length} image(s)${pages[0] ? `, ex. ${pages[0].slice(0, 70)}` : ''}`)
         } catch (e) {
-            await this.debug(`pages ${siteId} (${engine.name}) : erreur ${e instanceof Error ? e.message : String(e)}`)
+            await this.debug(`pages ${siteId} (${engineName}) : erreur ${e instanceof Error ? e.message : String(e)}`)
+            // Le site ne répond pas : on reprend la dernière liste connue de ce chapitre, s'il y en a une
+            if (cached) {
+                await this.rememberImageHosts(cached.p, base)
+                return App.createChapterDetails({ id: chapterId, mangaId, pages: cached.p })
+            }
             throw e
         }
-        // Les images sont souvent sur un autre serveur qui exige le site comme Referer
-        for (const p of pages) this.imageReferers.set(hostOf(p), `${base}/`)
+        if (pages.length === 0) {
+            if (cached) return App.createChapterDetails({ id: chapterId, mangaId, pages: cached.p })
+            throw new Error('Aucune page trouvée pour ce chapitre. Lance « Diagnostic d\'un manga » dans les réglages de TagFusion et envoie le journal.')
+        }
+        await this.rememberImageHosts(pages, base)
+        try { await this.store.setCachedPages(cacheKey, pages) } catch { /* le cache ne doit pas bloquer la lecture */ }
         return App.createChapterDetails({ id: chapterId, mangaId, pages })
+    }
+
+    /** Retient le site d'origine de chaque serveur d'images (en mémoire et dans le stockage) */
+    private async rememberImageHosts(pages: string[], base: string): Promise<void> {
+        const map: Record<string, string> = {}
+        for (const p of pages) { const h = hostOf(p); if (h) { map[h] = `${base}/`; this.imageReferers.set(h, `${base}/`) } }
+        try { await this.store.addImageReferers(map) } catch { /* sans gravité */ }
     }
 
     override getMangaShareUrl(mangaId: string): string {

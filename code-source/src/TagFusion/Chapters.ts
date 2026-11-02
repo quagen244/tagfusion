@@ -733,13 +733,30 @@ export async function galleryPages(f: Fetcher, $: CheerioAPI, url: string, html 
         const tpl = numberTemplate(known[0] as string, first.n, known[1] as string, first.n + 1)
         return tpl ? allNumbers.map(tpl) : known
     }
+    // Les grandes images suivent-elles elles-mêmes un modèle numéroté ? (vérifié sur 3 pages réelles)
+    if (samples.length >= 3 && sampleFull.every(Boolean)) {
+        const n = samples.map(i => (thumbs[i] as { n: number }).n)
+        const tpl = numberTemplate(sampleFull[0] as string, n[0] as number, sampleFull[1] as string, n[1] as number)
+        if (tpl && tpl(n[2] as number) === (sampleFull[2] as string).replace(/[?#].*$/, '')) return allNumbers.map(tpl)
+    }
     // Pas de règle sûre : on ouvre chaque page de lecture (y compris les pages non affichées)
-    let pageUrls = thumbs.map(t => t.url)
+    let slots: { url: string, thumb: string }[] = thumbs.map(t => ({ url: t.url, thumb: t.thumb }))
     if (missing) {
         const tpl = numberTemplate(first.url, first.n, (thumbs[1] as { url: string }).url, first.n + 1)
-        if (tpl) pageUrls = allNumbers.map(tpl)
+        if (tpl) slots = allNumbers.map((num, i) => ({ url: tpl(num), thumb: thumbs[i]?.thumb ?? '' }))
     }
-    const pages = await mapLimitSimple(pageUrls.slice(0, 500), 4, async u => { try { return await fullOf(u) } catch { return undefined } })
+    // Les pages déjà ouvertes pour la vérification ne sont pas redemandées
+    const known = new Map<string, string>()
+    samples.forEach((i, k) => { const full = sampleFull[k]; if (full) known.set((thumbs[i] as { url: string }).url, full) })
+    const pages = await mapLimitSimple(slots.slice(0, 500), 4, async slot => {
+        const hit = known.get(slot.url)
+        if (hit) return hit
+        // Deuxième chance (le réseau réessaie déjà lui-même), puis la miniature pour garder la place et l'ordre
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try { const full = await fullOf(slot.url); if (full) return full } catch { /* nouvel essai */ }
+        }
+        return slot.thumb || undefined
+    })
     return pages.filter((x): x is string => !!x)
 }
 
@@ -758,6 +775,25 @@ export function numberTemplate(exA: string, a: number, exB: string, b: number): 
     const pad = digits.startsWith('0') && digits.length > 1
     const make = (n: number): string => before + (pad ? String(n + offset).padStart(digits.length, '0') : String(n + offset)) + after
     return make(a) === exA.replace(/[?#].*$/, '') && make(b) === exB.replace(/[?#].*$/, '') ? make : null
+}
+
+/**
+ * Remet les pages dans l'ordre si, et seulement si, ce sont clairement les pages numérotées d'un
+ * même dossier (même début et même fin d'adresse, numéros tous différents et consécutifs) mais dans
+ * le désordre. Sinon la liste est gardée telle quelle : on ne devine jamais un ordre.
+ */
+export function orderPages(pages: string[]): string[] {
+    if (pages.length < 3) return pages
+    const parsed = pages.map(p => /^(.*?)(\d+)(\D*)$/.exec(p.replace(/[?#].*$/, '')))
+    if (parsed.some(m => !m)) return pages
+    const pre = (parsed[0] as RegExpExecArray)[1]
+    const suf = (parsed[0] as RegExpExecArray)[3]
+    if (parsed.some(m => (m as RegExpExecArray)[1] !== pre || (m as RegExpExecArray)[3] !== suf)) return pages
+    const nums = parsed.map(m => Number((m as RegExpExecArray)[2]))
+    const sorted = [...nums].sort((a, b) => a - b)
+    const contiguous = new Set(nums).size === nums.length && sorted.every((v, i) => i === 0 || v === (sorted[i - 1] as number) + 1)
+    if (!contiguous || nums.every((v, i) => i === 0 || v > (nums[i - 1] as number))) return pages
+    return pages.map((p, i) => ({ p, n: nums[i] as number })).sort((a, b) => a.n - b.n).map(x => x.p)
 }
 
 /** Règles miniature -> grande image, combinables ; retenue seulement si elle reproduit tous les exemples */
@@ -808,13 +844,18 @@ export async function universalPagesDeep(f: Fetcher, $: CheerioAPI, html: string
     })
     const out = [...pages]
     if (urls.length) {
-        for (const u of urls.slice(0, 200)) {
-            try {
-                const h = await f.get(u)
-                const img = universalPages(f.load(h), h, u)[0]
-                if (img && !out.includes(img)) out.push(img)
-            } catch { /* page illisible */ }
-        }
+        // Toutes les pages du menu, en parallèle mais rangées à leur place (l'ordre du menu)
+        const imgs = await mapLimitSimple(urls.slice(0, 300), 4, async u => {
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    const h = await f.get(u)
+                    const img = universalPages(f.load(h), h, u)[0]
+                    if (img) return img
+                } catch { /* nouvel essai */ }
+            }
+            return undefined
+        })
+        for (const img of imgs) if (img && !out.includes(img)) out.push(img)
         return out
     }
     // Sinon : lien "suivant" de page en page (dans le même chapitre)
