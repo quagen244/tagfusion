@@ -23,14 +23,14 @@ import { CheerioAPI } from 'cheerio'
 import { galleryPages, orderPages, parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
 import { Details, detectEngine, Engine, engineByName, Fetcher, findNextPageUrl, ListingItem, pageCandidates } from './Engines'
 import { buildSettings } from './Settings'
-import { SiteTag, Store, UnifiedTag } from './Store'
+import { IndexedManga, SiteInfo, SiteTag, Store, UnifiedTag } from './Store'
 import {
     cleanTagLabel, decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
     mapLimit, safeDate, safeEncode, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, tagKey, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.8.0',
+    version: '1.9.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -60,6 +60,13 @@ interface SearchMeta {
 }
 
 const DISCOVERY_BUDGET_MS = 10000
+/** Accueil : nombre de mangas du carrousel « À la une » et nombre de rangées de tags */
+const HOME_FEATURED = 12
+const HOME_TAG_ROWS = 5
+/** Tags trop généraux pour faire une rangée (langue, format, public) */
+const GENERIC_TAGS = new Set(['english', 'japanese', 'chinese', 'korean', 'french', 'spanish', 'translated', 'rewrite', 'speechless',
+    'full color', 'manga', 'manhwa', 'manhua', 'webtoon', 'doujinshi', 'artist cg', 'game cg', 'western', 'image set', 'non h',
+    'uncensored', 'decensored', 'censored', 'anthology', 'hentai', 'adult', 'mature', '18 plus', 'ecchi', 'smut', 'completed', 'ongoing'])
 /** Nombre de mangas visé par page de résultats (de quoi remplir l'écran et pouvoir faire défiler) */
 const BATCH_SIZE = 24
 /** Parcours d'un catalogue : fiches lues par site et par tour, et sites parcourus par tour */
@@ -361,14 +368,47 @@ export class TagFusion extends Source {
     // Page d'accueil : les dernières sorties de chaque site (et l'accès au nuage ☁️)
     // =========================================================================
 
+    /**
+     * Page d'accueil, dans l'ordre :
+     *  1. « À la une » : grand carrousel des derniers mangas ouverts ou indexés, tous sites confondus ;
+     *  2. une rangée par tag populaire (tirée de l'index : instantanée, sans attendre les sites) ;
+     *  3. « Nouveautés · site » : les dernières sorties de chaque site, à mesure qu'elles arrivent.
+     * Tout se termine avant de rendre la main à l'app (aucune tâche en arrière-plan).
+     */
     override async getHomePageSections(sectionCallback: (section: HomeSection) => void): Promise<void> {
         await this.debug('page d\'accueil : chargement')
         try {
             await this.userAgent()
             await this.store.getCloudflareBlocked()
             const sites = (await this.store.getSites()).slice(0, 12)
-            await mapLimit(sites, 3, async base => {
+            const info = await this.store.getSiteInfo()
+            const indexed = await this.store.searchIndex([], [], sites.map(siteIdOf)).catch(() => [])
+
+            // 1. « À la une » depuis l'index (si assez de mangas illustrés), sinon depuis les sites plus bas
+            const featuredFromIndex = this.indexToPartials(indexed.filter(m => m.i), info, HOME_FEATURED)
+            // Pas assez dans l'index (premier lancement) : on attend les nouveautés des sites, puis on envoie
+            // tout dans l'ordre. Jamais de section vide, même si aucun site ne répond.
+            const featuredWaitsForSites = featuredFromIndex.length < 5
+            if (!featuredWaitsForSites) {
+                sectionCallback(App.createHomeSection({ id: 'home_featured', title: 'À la une', type: HomeSectionType.featured, items: featuredFromIndex, containsMoreItems: true }))
+            }
+
+            // 2. Rangées des tags les plus présents dans l'index
+            const tagRows = await this.popularTagRows(indexed, info)
+            for (const row of tagRows) {
+                sectionCallback(App.createHomeSection({
+                    id: 'home_tag_' + safeEncode(row.key), title: row.label, type: HomeSectionType.singleRowNormal,
+                    items: row.items, containsMoreItems: true
+                }))
+            }
+
+            // 3. Nouveautés de chaque site (envoyées à mesure, sauf au premier lancement : rangées dans l'ordre à la fin)
+            const latest: PartialSourceManga[][] = []
+            const held: (HomeSection | undefined)[] = new Array(sites.length)
+            const deadline = Date.now() + 20000
+            await mapLimit(sites.map((b, i) => ({ base: b, i })), 3, async ({ base, i }) => {
                 const siteId = siteIdOf(base)
+                if (Date.now() > deadline) return
                 try {
                     const engine = await this.engineOf(siteId)
                     const $ = this.fetcher.load(await this.fetcher.get(`${base}/`))
@@ -376,31 +416,110 @@ export class TagFusion extends Source {
                     // Jamais de section vide
                     if (items.length === 0) return
                     const name = (await this.store.site(siteId))?.name || siteId
-                    sectionCallback(App.createHomeSection({
-                        id: 'home_' + safeEncode(siteId),
-                        title: name.slice(0, 60),
+                    latest[i] = items.map(it => App.createPartialSourceManga({ mangaId: it.mangaId, title: it.title, image: it.image, subtitle: name.slice(0, 60) }))
+                    const section = App.createHomeSection({
+                        id: 'home_site_' + safeEncode(siteId),
+                        title: `Nouveautés · ${name}`.slice(0, 70),
                         type: HomeSectionType.singleRowNormal,
                         items,
-                        containsMoreItems: false
-                    }))
+                        containsMoreItems: true
+                    })
+                    if (featuredWaitsForSites) held[i] = section
+                    else sectionCallback(section)
                 } catch (e) {
                     await this.store.updateSite(siteId, { error: e instanceof Error ? e.message : String(e) })
                 }
             })
-            await this.debug(`page d'accueil : terminée (${this.store.cloudflareBlockedSync().length} site(s) bloqué(s) par Cloudflare)`)
+
+            if (featuredWaitsForSites) {
+                // « À la une » : les nouveautés de tous les sites, en alternance, sans doublon ; puis les rangées des sites
+                const seen = new Set<string>()
+                const mixed = interleave(latest.filter(Boolean)).filter(m => !seen.has(m.mangaId) && (seen.add(m.mangaId), true)).slice(0, HOME_FEATURED)
+                const items = mixed.length ? mixed : featuredFromIndex
+                if (items.length) sectionCallback(App.createHomeSection({ id: 'home_featured', title: 'À la une', type: HomeSectionType.featured, items, containsMoreItems: false }))
+                for (const section of held) if (section) sectionCallback(section)
+            }
+            await this.debug(`page d'accueil : ${tagRows.length} rangée(s) de tags, ${latest.filter(Boolean).length} site(s) chargé(s), ${this.store.cloudflareBlockedSync().length} bloqué(s) par Cloudflare`)
         } catch (e) {
             await this.debug(`page d'accueil : erreur ${e instanceof Error ? e.message : String(e)}`)
         }
     }
 
-    override async getViewMoreItems(homepageSectionId: string, _metadata: unknown): Promise<PagedResults> {
+    /** Rangées des tags les plus présents dans l'index (hors tags de format ou de langue) */
+    private async popularTagRows(indexed: (IndexedManga & { id: string })[], info: Record<string, SiteInfo>): Promise<{ key: string, label: string, items: PartialSourceManga[] }[]> {
+        const unified = await this.store.unified()
+        const merges = await this.store.customMerges()
+        const candidates = Object.values(unified)
+            .filter(u => u.indexed >= 3 && !GENERIC_TAGS.has(u.key))
+            .sort((a, b) => b.indexed - a.indexed || a.label.localeCompare(b.label))
+        const rows: { key: string, label: string, items: PartialSourceManga[] }[] = []
+        for (const u of candidates) {
+            if (rows.length >= HOME_TAG_ROWS) break
+            const withTag = indexed.filter(m => m.l.some(l => tagKey(l, merges) === u.key))
+            const items = this.indexToPartials(withTag, info, 20)
+            if (items.length >= 3) rows.push({ key: u.key, label: (cleanTagLabel(u.label) || u.label).replace(/^\w/, c => c.toUpperCase()).slice(0, 60), items })
+        }
+        return rows
+    }
+
+    /** Mangas de l'index -> tuiles Paperback (sans doublon de titre, nom du site en sous-titre) */
+    private indexToPartials(list: (IndexedManga & { id: string })[], info: Record<string, SiteInfo>, limit: number): PartialSourceManga[] {
+        const out: PartialSourceManga[] = []
+        const seen = new Set<string>()
+        for (const m of list) {
+            if (out.length >= limit) break
+            const tk = titleKey(m.t)
+            const key = tk.length >= 3 ? 't' + tk : 'i' + m.id
+            if (seen.has(key) || seen.has('i' + m.id)) continue
+            seen.add(key)
+            seen.add('i' + m.id)
+            out.push(App.createPartialSourceManga({
+                mangaId: m.id, title: (m.t || 'Sans titre').slice(0, 200), image: safeUrl(m.i),
+                subtitle: (info[m.s]?.name || m.s).slice(0, 60)
+            }))
+        }
+        return out
+    }
+
+    /**
+     * « Voir plus » d'une rangée de l'accueil :
+     *  - tag : la recherche de ce tag sur tous les sites, avec défilement infini ;
+     *  - « À la une » : tout l'index, du plus récent au plus ancien ;
+     *  - site : son catalogue, page après page (en suivant sa vraie pagination).
+     */
+    override async getViewMoreItems(homepageSectionId: string, metadata: unknown): Promise<PagedResults> {
         try {
-            const siteId = safeDecode(homepageSectionId.replace(/^home_/, ''))
+            if (homepageSectionId.startsWith('home_tag_')) {
+                const key = safeDecode(homepageSectionId.slice('home_tag_'.length))
+                return await this.doSearch({ includedTags: [App.createTag({ id: tagIdOf(key), label: key })], excludedTags: [], parameters: {} } as SearchRequest, metadata)
+            }
+            if (homepageSectionId === 'home_featured') {
+                const offset = typeof (metadata as { offset?: unknown } | undefined)?.offset === 'number' ? (metadata as { offset: number }).offset : 0
+                const sites = (await this.store.getSites()).map(siteIdOf)
+                const all = await this.store.searchIndex([], [], sites)
+                const pageItems = this.indexToPartials(all.slice(offset, offset + 60), await this.store.getSiteInfo(), 60)
+                const next = offset + 60
+                return App.createPagedResults({ results: pageItems, metadata: next < all.length ? { offset: next } : undefined })
+            }
+            // Rangée d'un site (identifiant actuel « home_site_… » ou ancien « home_… »)
+            const siteId = safeDecode(homepageSectionId.replace(/^home_site_/, '').replace(/^home_/, ''))
             const base = await this.baseOf(siteId)
             const engine = await this.engineOf(siteId)
-            const $ = this.fetcher.load(await this.fetcher.get(`${base}/`))
-            return App.createPagedResults({ results: this.toPartials(siteId, engine.parseListing($, `${base}/`, base)) })
-        } catch {
+            const m = (metadata ?? {}) as { page?: number, next?: string, pg?: 'links' | 'guess', start?: string, seen?: string[] }
+            const page = (m.page ?? 0) + 1
+            const start = m.start ?? (await this.catalogOf(siteId, engine, base) || `${base}/`)
+            const res = await this.fetchListing(start, page, m.next, m.pg, engine, base)
+            if (!res) return App.createPagedResults({ results: [] })
+            const seen = new Set(m.seen ?? [])
+            const results = this.toPartials(siteId, res.items).filter(r => !seen.has(r.mangaId))
+            for (const r of results) seen.add(r.mangaId)
+            const finished = results.length === 0 || (res.mode === 'links' && !res.next)
+            return App.createPagedResults({
+                results,
+                metadata: finished ? undefined : { page, next: res.next, pg: res.mode, start, seen: [...seen].slice(-2000) }
+            })
+        } catch (e) {
+            await this.debug(`voir plus (${homepageSectionId.slice(0, 40)}) : erreur ${e instanceof Error ? e.message : String(e)}`)
             return App.createPagedResults({ results: [] })
         }
     }

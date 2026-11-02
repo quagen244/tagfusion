@@ -68,7 +68,9 @@ export class Store {
     private raw?: { data: RawTags, at: number }
     private info?: { data: Record<string, SiteInfo>, at: number }
     private index?: { data: MangaIndex, at: number }
-    private unifiedCache?: { forRaw: RawTags, forIndex: MangaIndex, merges: string, data: Record<string, UnifiedTag> }
+    private unifiedCache?: { forRaw: RawTags, forIndex: MangaIndex, merges: string, rev: number, rawSig: string, indexSig: string, data: Record<string, UnifiedTag> }
+    /** Compteur de modifications des tags et de l'index (une copie en mémoire n'est valable que pour la même valeur) */
+    private rev = 0
     private writeChain: Promise<void> = Promise.resolve()
 
     constructor(private readonly state: SourceStateManager) {}
@@ -118,6 +120,7 @@ export class Store {
             const raw = await this.load<RawTags>(K_RAW)
             for (const id of Object.keys(raw)) if (!keep.has(id)) delete raw[id]
             await this.state.store(K_RAW, raw)
+            this.rev++
             this.raw = { data: raw, at: Date.now() }
         })
     }
@@ -184,7 +187,7 @@ export class Store {
                     changed = true
                 }
             }
-            if (changed) await this.state.store(K_RAW, raw)
+            if (changed) { await this.state.store(K_RAW, raw); this.rev++ }
             return added
         })
     }
@@ -193,6 +196,7 @@ export class Store {
         await this.serial(async () => {
             await this.state.store(K_RAW, {})
             await this.state.store(K_INDEX, {})
+            this.rev++
             this.raw = { data: {}, at: Date.now() }
             this.index = { data: {}, at: Date.now() }
             const info = await this.load<Record<string, SiteInfo>>(K_INFO)
@@ -242,6 +246,7 @@ export class Store {
                 for (const id of ids.slice(0, ids.length - INDEX_LIMIT)) delete index[id]
             }
             await this.state.store(K_INDEX, index)
+            this.rev++
             return changed
         })
     }
@@ -273,6 +278,7 @@ export class Store {
 
     async setMergesText(text: string): Promise<void> {
         await this.state.store(K_MERGES, text)
+        this.rev++
         this.unifiedCache = undefined
     }
 
@@ -285,8 +291,10 @@ export class Store {
         const raw = await this.getRaw()
         const index = await this.getIndex()
         const mergesText = await this.getMergesText()
+        const rawSig = Object.entries(raw).map(([k, v]) => `${k}:${Object.keys(v).length}`).join(',')
+        const indexSig = `${Object.keys(index).length}:${Object.values(index).reduce((n, m) => n + m.l.length + (m.at % 997), 0)}`
         const c = this.unifiedCache
-        if (c && c.forRaw === raw && c.forIndex === index && c.merges === mergesText) return c.data
+        if (c && c.forRaw === raw && c.forIndex === index && c.merges === mergesText && c.rev === this.rev && c.rawSig === rawSig && c.indexSig === indexSig) return c.data
 
         const merges = parseCustomMerges(mergesText)
         const out: Record<string, UnifiedTag> = {}
@@ -321,7 +329,7 @@ export class Store {
             const u = out[key]
             if (best && u && normalizeTagText(best[0]) === key) u.label = best[0]
         }
-        this.unifiedCache = { forRaw: raw, forIndex: index, merges: mergesText, data: out }
+        this.unifiedCache = { forRaw: raw, forIndex: index, merges: mergesText, rev: this.rev, rawSig, indexSig, data: out }
         return out
     }
 
@@ -406,6 +414,7 @@ export class Store {
     async resetAll(full: boolean): Promise<void> {
         await this.serial(async () => {
             for (const k of [K_RAW, K_INDEX, K_INFO, 'tf_pages_cache']) await this.state.store(k, {})
+            this.rev++
             await this.state.store(K_CF, [])
             await this.state.store('tf_debug', [])
             await this.state.store('tf_repos_imported_at', 0)
