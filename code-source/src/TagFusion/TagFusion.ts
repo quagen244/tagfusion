@@ -21,7 +21,7 @@ import {
     TagSection
 } from '@paperback/types'
 import { CheerioAPI } from 'cheerio'
-import { galleryPages, orderPages, pagesFromEncryptedReader, parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
+import { galleryPages, orderPages, pagesFromEncryptedReader, pagesFromFolderData, parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
 import { Details, detectEngine, Engine, engineByName, Fetcher, findNextPageUrl, ListingItem, pageCandidates } from './Engines'
 import { buildSettings } from './Settings'
 import { IndexedManga, SiteInfo, SiteTag, Store, UnifiedTag } from './Store'
@@ -31,7 +31,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.12.0',
+    version: '1.13.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -1369,7 +1369,7 @@ export class TagFusion extends Source {
     override async getChapterDetails(mangaId: string, chapterId: string): Promise<ChapterDetails> {
         const { siteId } = decodeMangaId(mangaId)
         const base = await this.baseOf(siteId)
-        const cacheKey = `v3|${siteId}|${chapterId}`
+        const cacheKey = `v4|${siteId}|${chapterId}`
         // Paperback redemande souvent le même chapitre (préchargement, retour en arrière) :
         // on renvoie exactement la même liste pendant 30 minutes, pour un ordre et un nombre de pages stables
         const cached = await this.store.getCachedPages(cacheKey).catch(() => undefined)
@@ -1387,6 +1387,8 @@ export class TagFusion extends Source {
             const $p = this.fetcher.load(html)
             // Lecteur chiffré (type HentaiNexus) : la liste exacte des pages, déchiffrée
             let found = pagesFromEncryptedReader(html, hostOf(pageUrl)) ?? []
+            // Liste complète des pages dans les données de la page (type EAHentai : la page n'en affiche que quelques-unes)
+            if (found.length < 1) found = pagesFromFolderData($p, html, pageUrl) ?? []
             // Galerie (miniatures vers des pages de lecture) : images en taille réelle, jamais les miniatures
             if (found.length < 1) found = await galleryPages(this.fetcher, $p, pageUrl, html)
             if (found.length < 2) found = engine.parsePages($p, html, pageUrl)

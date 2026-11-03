@@ -388,8 +388,12 @@ export async function universalChapters(f: Fetcher, mangaUrl: string, $: Cheerio
 
     // 1. Éléments cliquables de la fiche (liens, data-href, onclick, grilles de numéros)
     let cands: Candidate[] = []
+    // Miniatures d'une galerie (lien avec une image vers « /a/ID/N ») : des PAGES du manga, pas des chapitres
+    // (EAHentai : 24 miniatures numérotées « 1 », « 2 »… qui ressemblaient à 24 chapitres)
+    const thumbUrls = new Set(galleryLinks($, mangaUrl, mangaUrl).filter(t => t.thumb).map(t => t.url.replace(/[?#].*$/, '').replace(/\/$/, '')))
+    const isThumbPage = (c: Candidate): boolean => thumbUrls.size >= 2 && thumbUrls.has(c.url.replace(/[?#].*$/, '').replace(/\/$/, '')) && !CHAPTER_WORDS.test(c.text)
     await step('liens de la fiche', () => {
-        cands = pickChapterList(chapterCandidates($, mangaUrl, base, mangaUrl), mangaUrl)
+        cands = pickChapterList(chapterCandidates($, mangaUrl, base, mangaUrl).filter(c => !isThumbPage(c)), mangaUrl)
         return toItems(cands)
     })
     if (chapters.length >= 2) {
@@ -550,6 +554,12 @@ export function galleryPageUrls($: CheerioAPI, galleryUrl: string, count: number
  * pour ne pas confondre avec un autre nombre de la page (« 2303 pages » d'une pagination, etc.).
  */
 export function totalPagesOf($: CheerioAPI, html: string, shown = 1): number {
+    const plausible = plausibleTotals($, html, shown)
+    return plausible.length ? Math.min(...plausible) : 0
+}
+
+/** Tous les nombres de pages annoncés par la page qui sont plausibles pour cette galerie */
+function plausibleTotals($: CheerioAPI, html: string, shown: number): number[] {
     const found: number[] = []
     $('input[id*="pages"], input[name*="pages"], input[id*="Pages"]').each((_, el) => {
         const v = Number(el.attribs['value'])
@@ -560,8 +570,7 @@ export function totalPagesOf($: CheerioAPI, html: string, shown = 1): number {
         const v = Number(m[1] ?? m[2])
         if (v > 0 && v < 3000) found.push(v)
     }
-    const plausible = found.filter(v => v >= shown && v <= Math.max(shown * 30, shown + 30))
-    return plausible.length ? Math.min(...plausible) : 0
+    return found.filter(v => v >= shown && v <= Math.max(shown * 30, shown + 30))
 }
 
 /** Nombre d'images de lecture affichées directement sur une page (dans une zone de lecteur, hors liens) */
@@ -1080,4 +1089,91 @@ export async function universalPagesDeep(f: Fetcher, $: CheerioAPI, html: string
         } catch { break }
     }
     return out
+}
+
+/** Texte d'un vrai lien de chapitre */
+const CHAPTER_WORDS = /\b(?:chap(?:ter|itre)?s?|ch\.?\s*\d|episodes?|ep\.?\s*\d|vol(?:ume)?\.?|tome|cap[ií]tulo|part(?:ie)?\s*\d)/i
+
+/** Dossier de miniatures (« …/HASH/thumbnail/ », « …/thumbs/ ») : les grandes images sont dans le dossier parent */
+const THUMB_DIR = /^(?:thumbs?|thumbnails?|small|previews?|mini|t)$/i
+/** Nom de miniature à côté des grandes images (« image1t.jpg », « 1t.jpg ») */
+const THUMB_FILE = /\d+t\.(?:jpe?g|png|webp|gif|avif)$/i
+
+/**
+ * Liste complète des pages écrite dans les données de la page (Next.js, JSON, scripts) :
+ * toutes les images du dossier de la galerie, dans l'ordre où le site les donne (EAHentai :
+ * "imageUri":"galleries/HASH/image1.webp", formats mélangés). Le dossier est celui des miniatures
+ * (ou des images affichées) ; seules les images directement dans ce dossier comptent, jamais celles
+ * des autres galeries citées sur la page (suggestions) ni les miniatures.
+ * Utilisée seulement pour une galerie (miniatures) ou quand les données annoncent plus de pages que la page n'en affiche.
+ */
+export function pagesFromFolderData($: CheerioAPI, html: string, url: string): string[] | null {
+    if (!html) return null
+    const thumbs = galleryLinks($, url, url)
+    const hints: string[] = thumbs.map(t => t.thumb).filter(Boolean)
+    const shownImages: string[] = []
+    $('img').each((_, el) => {
+        const src = absoluteUrl(pickImageSrc(el.attribs), url)
+        if (src && !NOT_PAGE.test(src.replace(/[?#].*$/, '').replace(/\/(?:thumbs?|thumbnails?)\/[^/]+$/i, '/x.jpg'))) shownImages.push(src)
+    })
+    hints.push(...shownImages)
+    // Dossiers candidats : dossier de l'image (ou son parent si c'est un dossier de miniatures)
+    const folders = new Map<string, number>()
+    for (const h of hints) {
+        const clean = h.replace(/[?#].*$/, '')
+        let dir = clean.slice(0, clean.lastIndexOf('/'))
+        const last = dir.slice(dir.lastIndexOf('/') + 1)
+        if (THUMB_DIR.test(last)) dir = dir.slice(0, dir.lastIndexOf('/'))
+        if (!/^https?:\/\/[^/]+\/.+/.test(dir)) continue
+        folders.set(dir, (folders.get(dir) ?? 0) + 1)
+    }
+    if (folders.size === 0) return null
+    const unescape = (t: string): string => t
+        .replace(/\\u([0-9a-fA-F]{4})/g, (_, x: string) => String.fromCharCode(parseInt(x, 16)))
+        .replace(/\\+"/g, '"').replace(/\\+\//g, '/')
+    // Les données (scripts) d'abord : c'est là que la liste est complète et dans l'ordre du site ;
+    // les images affichées dans la page (une fenêtre autour de la page courante) passent après
+    const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1] as string).join('\n')
+    const texts = [unescape(scripts), unescape(html)]
+    // Nombres de pages annoncés (seulement sur une galerie : sur une page de lecture, « Page 6 » n'est pas un total)
+    const totals = thumbs.length >= 2 ? plausibleTotals($, html, thumbs.length) : []
+    let best: string[] = []
+    // Le dossier le plus représenté d'abord (celui des miniatures de la galerie)
+    for (const [dir] of [...folders.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)) {
+        const segs = dir.replace(/^https?:\/\/[^/]+\//, '').split('/')
+        const seg = segs[segs.length - 1] as string
+        const parent = segs[segs.length - 2]
+        // Le nom du dossier doit être assez particulier (identifiant, code) pour ne désigner que cette galerie
+        if (!parent || seg.length < 3 || !/\d/.test(seg)) continue
+        const key = `${parent}/${seg}/`
+        const re = new RegExp(`([A-Za-z0-9_.~:%/-]*?)${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^"'\\s<>?#/\\\\]+\\.(?:jpe?g|png|webp|gif|avif))(?=[?#"'\\s\\\\<]|$)`, 'gi')
+        for (const text of texts) {
+            const out: string[] = []
+            for (const m of text.matchAll(re)) {
+                const file = m[2] as string
+                if (THUMB_FILE.test(file)) continue
+                const lead = m[1] as string
+                let abs: string | null = null
+                if (/^https?:\/\//i.test(lead)) abs = lead + key + file
+                else if (lead.startsWith('//')) abs = 'https:' + lead + key + file
+                else {
+                    // Chemin relatif (« galleries/HASH/image1.webp ») : on le replace dans l'adresse du dossier
+                    const at = (dir + '/').lastIndexOf(key)
+                    if (at >= 0) abs = (dir + '/').slice(0, at) + key + file
+                }
+                if (abs && !out.includes(abs)) out.push(abs)
+            }
+            if (out.length >= 2) { best = out; break }
+        }
+        // Le dossier principal a donné sa liste : on ne regarde pas les autres (galeries suggérées)
+        if (best.length >= 2) break
+    }
+    if (best.length < 2) return null
+    // Contrôles : autant de pages que la galerie l'annonce, au moins autant que de miniatures,
+    // et (hors galerie) plus que ce que la page affiche, sinon la lecture habituelle suffit
+    if (totals.length && !totals.includes(best.length)) return null
+    if (best.length < thumbs.length) return null
+    const shownHere = shownImages.filter(s => best.includes(s.replace(/[?#].*$/, ''))).length
+    if (thumbs.length < 2 && best.length <= shownHere) return null
+    return best
 }
