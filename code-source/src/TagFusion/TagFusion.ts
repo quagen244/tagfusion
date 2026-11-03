@@ -27,11 +27,11 @@ import { buildSettings } from './Settings'
 import { IndexedManga, SiteInfo, SiteTag, Store, UnifiedTag } from './Store'
 import {
     absoluteUrl, cleanTagLabel, decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
-    mapLimit, safeDate, safeEncode, searchComboUrl, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, tagKey, titleKey
+    looksLikeChapterUrl, looksLikeMangaUrl, looksLikeTagUrl, mapLimit, safeDate, safeEncode, searchComboUrl, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, tagKey, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.14.0',
+    version: '1.15.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -108,6 +108,14 @@ const CRAWL_BATCH = 15
 const CRAWL_SITES_PER_ROUND = 4
 /** Mangas de l'index renvoyés au plus par page de résultats (l'index est parcouru en entier, page après page) */
 const INDEX_PAGE = 60
+/** Liens du menu d'un site qui mènent à la liste de ses tags */
+const TAG_DIR_TEXT = /^(?:tags?|all tags|genres?|all genres|categor(?:y|ies)|themes?|keywords?|cat[ée]gories|th[èe]mes|g[ée]nero?s?)$/i
+const TAG_DIR_PATH = /^\/(?:tags?|genres?|categor(?:y|ies)|themes?|keywords?|tag-list|genre-list|all-tags|all-genres)\/?$/i
+
+/** Liens du menu d'un site qui mènent à la liste de tous ses mangas */
+const CATALOG_TEXT = /^(?:latest(?: updates?| releases?| uploads?)?|recent(?:ly added| updates?)?|new(?:est)?(?: releases?)?|all(?: manga| mangas| comics| series| galleries| titles| doujinshi)?|browse(?: all)?|directory|manga ?list|comic ?list|series ?list|library|catalog(?:ue)?|a ?- ?z|az ?list|list|explore|archives?|updates?|galleries|comics|mangas?|nouveaut[ée]s|derni[èe]res? sorties|tous les mangas|biblioth[èe]que|catalogue)$/i
+const CATALOG_PATH = /^\/(?:latest|recent|newest|new|browse|directory|manga-list|mangalist|comic-list|series-list|library|catalog|catalogue|az-list|a-z|list|all|archive|archives|updates|galleries|comics|mangas|manga|series)\/?$/i
+
 /** Durée maximum d'une action lancée depuis les réglages */
 const SETTINGS_BUDGET_MS = 25000
 
@@ -317,14 +325,41 @@ export class TagFusion extends Source {
         try {
             const engine = await this.engineOf(siteId)
             const base = await this.baseOf(siteId)
-            for (const page of engine.discoveryPages(base)) {
+            // Pages qui listent des tags : les adresses habituelles, puis les liens du menu (« Tags », « Genres »…),
+            // chacune suivie sur ses pages suivantes (annuaires de tags paginés) : plus de tags connus = recherche plus complète
+            const queue: string[] = [...engine.discoveryPages(base)]
+            const seenPages = new Set<string>()
+            const depthOf = new Map<string, number>()
+            let pagesRead = 0
+            while (queue.length && pagesRead < 40) {
                 // Le minuteur n'existe pas dans Paperback 0.8 : on vérifie l'heure entre deux pages
                 if (Date.now() > deadline) return
+                const page = queue.shift() as string
+                if (seenPages.has(page)) continue
+                seenPages.add(page)
+                pagesRead++
                 try {
                     const $ = this.fetcher.load(await this.fetcher.get(page))
-                    await this.store.addTags(siteId, engine.parseTags($, page, base, false))
+                    const tags = engine.parseTags($, page, base, false)
+                    await this.store.addTags(siteId, tags)
+                    if (page === `${base}/`) {
+                        $('a[href]').each((_, el) => {
+                            const href = absoluteUrl($(el).attr('href'), page)
+                            if (!href || hostOf(href) !== hostOf(base)) return
+                            const text = $(el).text().replace(/\s+/g, ' ').trim()
+                            const path = href.replace(/^https?:\/\/[^/]+/, '').replace(/[?#].*$/, '')
+                            if (TAG_DIR_TEXT.test(text) || TAG_DIR_PATH.test(path)) queue.push(href.replace(/#.*$/, ''))
+                        })
+                    } else if (tags.length >= 10) {
+                        // Annuaire de tags : sa page suivante (jusqu'à 15 pages par annuaire)
+                        const depth = depthOf.get(page) ?? 0
+                        const next = findNextPageUrl($, page, depth + 1)
+                        if (next && depth < 14 && !seenPages.has(next)) { depthOf.set(next, depth + 1); queue.unshift(next) }
+                    }
                 } catch { /* page absente sur ce site : normal */ }
             }
+            // Le catalogue complet du site (pour fouiller tout le site quand un tag n'a pas de page) : trouvé dès maintenant
+            if (Date.now() < deadline - 3000) { try { await this.catalogOf(siteId, engine, base) } catch { /* sera retrouvé pendant une recherche */ } }
             await this.store.updateSite(siteId, { discoveredAt: Date.now(), error: undefined })
         } catch (e) {
             await this.store.updateSite(siteId, { error: e instanceof Error ? e.message : String(e) })
@@ -1018,22 +1053,51 @@ export class TagFusion extends Source {
         } catch { /* le journal ne doit jamais gêner */ }
     }
 
-    /** Page du catalogue complet d'un site (détectée une fois, puis mémorisée) */
+    /**
+     * Page du catalogue COMPLET d'un site (tous ses mangas, page après page), détectée une fois puis mémorisée :
+     * les adresses habituelles (/manga/, /series/…), les liens du menu du site qui mènent à une liste
+     * (« Latest », « Browse », « All », « Directory », « A-Z »…), et la page d'accueil. On garde la liste
+     * paginée la plus fournie (une liste sans page suivante ne montre qu'une partie du catalogue).
+     */
     private async catalogOf(siteId: string, engine: Engine, base: string): Promise<string> {
-        const known = (await this.store.site(siteId))?.catalog
-        if (known !== undefined) return known
-        for (const candidate of engine.catalogPages(base).slice(0, 4)) {
+        const known = await this.store.site(siteId)
+        if (known?.catalogV === 2 && known.catalog) return known.catalog
+        // Rien trouvé la dernière fois : on réessaie une fois par jour au plus
+        if (known?.catalogV === 2 && known.catalog === '' && Date.now() - (known.catalogAt ?? 0) < 86400000) return ''
+        const standard = engine.catalogPages(base)
+        const candidates: string[] = [...standard]
+        try {
+            const $h = this.fetcher.load(await this.fetcher.get(`${base}/`))
+            $h('a[href]').each((_, el) => {
+                const href = absoluteUrl($h(el).attr('href'), `${base}/`)
+                if (!href || hostOf(href) !== hostOf(base) || looksLikeTagUrl(href) || looksLikeMangaUrl(href) || looksLikeChapterUrl(href)) return
+                const text = ($h(el).text() || $h(el).attr('title') || '').replace(/\s+/g, ' ').trim()
+                const path = href.replace(/^https?:\/\/[^/]+/, '').replace(/[?#].*$/, '')
+                if (CATALOG_TEXT.test(text) || CATALOG_PATH.test(path)) candidates.push(href.replace(/#.*$/, ''))
+            })
+        } catch { /* page d'accueil injoignable : adresses habituelles seulement */ }
+        let best = ''
+        let bestScore = 0
+        const tried = new Set<string>()
+        const end = Date.now() + 15000
+        for (const candidate of candidates) {
+            if (tried.has(candidate) || tried.size >= 8 || Date.now() > end) continue
+            tried.add(candidate)
             try {
-                const items = engine.parseListing(this.fetcher.load(await this.fetcher.get(candidate)), candidate, base)
-                if (items.length >= 4) {
-                    await this.store.updateSite(siteId, { catalog: candidate })
-                    await this.debug(`catalogue de ${siteId} : ${candidate.replace(/^https?:\/\/[^/]+/, '')}`)
-                    return candidate
-                }
+                const $ = this.fetcher.load(await this.fetcher.get(candidate))
+                const items = engine.parseListing($, candidate, base)
+                if (items.length < 4) continue
+                const paged = !!findNextPageUrl($, candidate, 1)
+                // Une liste paginée l'emporte toujours (elle mène à tout le catalogue), puis la plus fournie
+                const score = (paged ? 10000 : 0) + items.length
+                if (score > bestScore) { best = candidate; bestScore = score }
+                // Adresse habituelle du moteur, paginée et bien fournie : c'est le catalogue, inutile de chercher plus loin
+                if (paged && items.length >= 10 && standard.includes(candidate)) break
             } catch { /* page absente : candidate suivante */ }
         }
-        await this.store.updateSite(siteId, { catalog: '' })
-        return ''
+        await this.store.updateSite(siteId, { catalog: best, catalogV: 2, catalogAt: Date.now() })
+        if (best) await this.debug(`catalogue de ${siteId} : ${best.replace(/^https?:\/\/[^/]+/, '') || '/'}${bestScore >= 10000 ? ' (paginé)' : ''}`)
+        return best
     }
 
     /**

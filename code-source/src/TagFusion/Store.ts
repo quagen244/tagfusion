@@ -30,6 +30,9 @@ export interface SiteInfo {
     catalog?: string
     /** 'no' : la recherche du site ignore les recherches à plusieurs tags (on ne réessaie plus) */
     combo?: 'no'
+    /** Version de la détection du catalogue (2 = catalogue complet et paginé) et date du dernier essai sans résultat */
+    catalogV?: number
+    catalogAt?: number
 }
 
 /** Un manga dont on a lu la fiche, avec tous ses tags (liens ou non) */
