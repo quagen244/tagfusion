@@ -48,9 +48,9 @@ async function main(): Promise<void> {
     const finalFeatured = first.filter(s => s.id === 'home_featured').pop()
     assert.ok(finalFeatured.items.length >= 8, `À la une rempli (${finalFeatured.items.length})`)
     assert.ok(finalFeatured.items.some((i: any) => i.subtitle === 'Alpha Scans') && finalFeatured.items.some((i: any) => i.subtitle === 'Beta Manga'), 'les deux sites mélangés')
-    assert.deepEqual(first.map(s => s.title), ['À la une', 'Nouveautés · Alpha Scans', 'Nouveautés · Beta Manga'], 'ordre exact, une seule fois chacune')
+    assert.deepEqual(first.map(s => s.title), ['À la une', 'Au hasard', 'Nouveautés · Alpha Scans', 'Nouveautés · Beta Manga'], 'ordre exact, une seule fois chacune')
     assert.ok(first.every(s => s.items.length > 0), 'aucune section vide')
-    console.log(`✓ Premier lancement (index vide) : « À la une » en haut, rempli avec ${finalFeatured.items.length} nouveautés des 2 sites ; rangées « Nouveautés · site »`)
+    console.log(`✓ Premier lancement (index vide) : « À la une » en haut, rempli avec ${finalFeatured.items.length} nouveautés des 2 sites ; « Au hasard » ; rangées « Nouveautés · site »`)
 
     // --- Index rempli (comme après quelques lectures) ---
     const entries = []
@@ -72,21 +72,23 @@ async function main(): Promise<void> {
     assert.equal(sections[0].type, 'featured')
     assert.equal(sections[0].items.length, 12)
     const tagRows = sections.filter(s => s.id.startsWith('home_tag_'))
-    assert.deepEqual(tagRows.map(s => s.title), ['Romance', 'Comedy', 'Office Workers'], `rangées : ${tagRows.map(s => s.title).join(', ')}`)
+    assert.deepEqual(tagRows.map(s => s.title).sort(), ['Comedy', 'Office Workers', 'Romance'], `rangées : ${tagRows.map(s => s.title).join(', ')}`)
     assert.ok(!sections.some(s => /english|translated/i.test(s.title)), 'pas de rangée « English » ni « Translated »')
     const lastTag = ids.lastIndexOf(tagRows[tagRows.length - 1].id)
     const firstSite = ids.findIndex(i => i.startsWith('home_site_'))
     assert.ok(lastTag < firstSite, 'les tags avant les nouveautés des sites')
-    assert.equal(tagRows[0].items.length, 6)
-    assert.ok(tagRows[0].items.every((i: any) => /^Indexé (2|4|6|8|10|12)$/.test(i.title)), 'la rangée Romance ne contient que des mangas Romance')
+    const romanceRow = tagRows.find(s => s.title === 'Romance')
+    assert.equal(romanceRow.items.length, 6)
+    assert.ok(romanceRow.items.every((i: any) => /^Indexé (2|4|6|8|10|12)$/.test(i.title)), 'la rangée Romance ne contient que des mangas Romance')
+    assert.ok(ids.includes('home_random'), 'rangée « Au hasard »')
     for (const s of sections) {
         if (s.items.length) assert.equal(new Set(s.items.map((i: any) => i.mangaId)).size, s.items.length, `doublon dans ${s.title}`)
     }
-    console.log('✓ Accueil : « À la une » (12, depuis l\'index) puis rangées Romance, Comedy, Office Workers (tags généraux exclus), puis nouveautés')
+    console.log('✓ Accueil : « À la une » (12, depuis l\'index), « Au hasard », rangées Romance, Comedy, Office Workers (tags généraux exclus), puis nouveautés')
 
     // --- « Voir plus » d'un tag : la recherche sur tous les sites, page après page ---
     await src.discoverAll(true)
-    const romanceId = tagRows[0].id
+    const romanceId = romanceRow.id
     let vm = await src.getViewMoreItems(romanceId, undefined)
     const seenTitles = vm.results.map((r: any) => r.title)
     let guard = 0

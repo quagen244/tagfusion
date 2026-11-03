@@ -31,7 +31,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.13.0',
+    version: '1.14.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -94,6 +94,9 @@ interface SearchControl {
 /** Accueil : nombre de mangas du carrousel « À la une » et nombre de rangées de tags */
 const HOME_FEATURED = 12
 const HOME_TAG_ROWS = 5
+/** Mangas de la rangée « Au hasard » (et de chaque page de son « Voir plus ») */
+const HOME_RANDOM = 20
+const RANDOM_PAGE = 40
 /** Tags trop généraux pour faire une rangée (langue, format, public) */
 const GENERIC_TAGS = new Set(['english', 'japanese', 'chinese', 'korean', 'french', 'spanish', 'translated', 'rewrite', 'speechless',
     'full color', 'manga', 'manhwa', 'manhua', 'webtoon', 'doujinshi', 'artist cg', 'game cg', 'western', 'image set', 'non h',
@@ -458,19 +461,28 @@ export class TagFusion extends Source {
             await this.store.getCloudflareBlocked()
             const sites = (await this.store.getSites()).slice(0, 12)
             const info = await this.store.getSiteInfo()
-            const indexed = await this.store.searchIndex([], [], sites.map(siteIdOf)).catch(() => [])
+            const indexed = (await this.store.searchIndex([], [], sites.map(siteIdOf)).catch(() => [])).filter(m => m.i)
+            // Découverte : chaque manga n'apparaît qu'une fois sur tout l'accueil, et le choix change à chaque fois
+            const used = new Set<string>()
+            const pick = (pool: PartialSourceManga[], n: number, min: number): PartialSourceManga[] =>
+                pickDistinct(pool, used, n, min)
 
-            // 1. « À la une » depuis l'index (si assez de mangas illustrés), sinon depuis les sites plus bas
-            const featuredFromIndex = this.indexToPartials(indexed.filter(m => m.i), info, HOME_FEATURED)
+            // 1. « À la une » : un mélange de tous les sites, pris au hasard parmi les plus récents de l'index
+            const recent = indexed.slice(0, 200)
+            const featuredFromIndex = pick(this.indexToPartials(mixBySite(recent), info, 200), HOME_FEATURED, HOME_FEATURED)
             // Pas assez dans l'index (premier lancement) : on attend les nouveautés des sites, puis on envoie
             // tout dans l'ordre. Jamais de section vide, même si aucun site ne répond.
             const featuredWaitsForSites = featuredFromIndex.length < 5
-            if (!featuredWaitsForSites) {
-                sectionCallback(App.createHomeSection({ id: 'home_featured', title: 'À la une', type: HomeSectionType.featured, items: featuredFromIndex, containsMoreItems: true }))
-            }
+            if (featuredWaitsForSites) for (const m of featuredFromIndex) unmark(used, m)
+            else sectionCallback(App.createHomeSection({ id: 'home_featured', title: 'À la une', type: HomeSectionType.featured, items: featuredFromIndex, containsMoreItems: true }))
 
-            // 2. Rangées des tags les plus présents dans l'index
-            const tagRows = await this.popularTagRows(indexed, info)
+            // 2. « Au hasard » : n'importe quel manga de l'index, toutes sources mélangées (nouveau tirage à chaque fois)
+            let randomRow = featuredWaitsForSites ? [] : pick(this.indexToPartials(mixBySite(shuffle(indexed)), info, 400), HOME_RANDOM, 5)
+            if (randomRow.length >= 5) sectionCallback(App.createHomeSection({ id: 'home_random', title: 'Au hasard', type: HomeSectionType.singleRowNormal, items: randomRow, containsMoreItems: true }))
+            else { for (const m of randomRow) unmark(used, m); randomRow = [] }
+
+            // 3. Rangées de tags : tirées parmi les tags les plus présents (pas toujours les mêmes), mangas au hasard
+            const tagRows = featuredWaitsForSites ? [] : await this.popularTagRows(indexed, info, pick)
             for (const row of tagRows) {
                 sectionCallback(App.createHomeSection({
                     id: 'home_tag_' + safeEncode(row.key), title: row.label, type: HomeSectionType.singleRowNormal,
@@ -478,7 +490,7 @@ export class TagFusion extends Source {
                 }))
             }
 
-            // 3. Nouveautés de chaque site (envoyées à mesure, sauf au premier lancement : rangées dans l'ordre à la fin)
+            // 4. Nouveautés de chaque site (envoyées à mesure, sauf au premier lancement : rangées dans l'ordre à la fin)
             const latest: PartialSourceManga[][] = []
             const held: (HomeSection | undefined)[] = new Array(sites.length)
             const deadline = Date.now() + 20000
@@ -488,32 +500,50 @@ export class TagFusion extends Source {
                 try {
                     const engine = await this.engineOf(siteId)
                     const $ = this.fetcher.load(await this.fetcher.get(`${base}/`))
-                    const items = this.toPartials(siteId, engine.parseListing($, `${base}/`, base).slice(0, 24))
-                    // Jamais de section vide
-                    if (items.length === 0) return
+                    const listing = engine.parseListing($, `${base}/`, base)
+                    // Tags affichés sur les vignettes : retenus pour les recherches
+                    const notes: SearchControl = { cancelled: () => false, reads: 0, deadline: 0, notes: new Map() }
+                    this.noteCards(notes, siteId, listing)
+                    await this.flushNotes(notes)
                     const name = (await this.store.site(siteId))?.name || siteId
-                    latest[i] = items.map(it => App.createPartialSourceManga({ mangaId: it.mangaId, title: it.title, image: it.image, subtitle: name.slice(0, 60) }))
-                    const section = App.createHomeSection({
+                    const all = this.toPartials(siteId, listing.slice(0, 40)).map(it => App.createPartialSourceManga({ mangaId: it.mangaId, title: it.title, image: it.image, subtitle: name.slice(0, 60) }))
+                    // Jamais de section vide
+                    if (all.length === 0) return
+                    latest[i] = all
+                    if (featuredWaitsForSites) { held[i] = App.createHomeSection({ id: 'home_site_' + safeEncode(siteId), title: `Nouveautés · ${name}`.slice(0, 70), type: HomeSectionType.singleRowNormal, items: all.slice(0, 24), containsMoreItems: true }); return }
+                    // Ce qui est déjà plus haut sur l'accueil n'est pas répété (s'il en reste assez)
+                    const items = pick(all, 24, 6)
+                    sectionCallback(App.createHomeSection({
                         id: 'home_site_' + safeEncode(siteId),
                         title: `Nouveautés · ${name}`.slice(0, 70),
                         type: HomeSectionType.singleRowNormal,
-                        items,
+                        items: items.length ? items : all.slice(0, 24),
                         containsMoreItems: true
-                    })
-                    if (featuredWaitsForSites) held[i] = section
-                    else sectionCallback(section)
+                    }))
                 } catch (e) {
                     await this.store.updateSite(siteId, { error: e instanceof Error ? e.message : String(e) })
                 }
             })
 
             if (featuredWaitsForSites) {
-                // « À la une » : les nouveautés de tous les sites, en alternance, sans doublon ; puis les rangées des sites
-                const seen = new Set<string>()
-                const mixed = interleave(latest.filter(Boolean)).filter(m => !seen.has(m.mangaId) && (seen.add(m.mangaId), true)).slice(0, HOME_FEATURED)
+                // « À la une » : les nouveautés de tous les sites, en alternance ; « Au hasard » : un tirage dans le reste ;
+                // puis les rangées des sites (sans ce qui est déjà plus haut, s'il en reste assez)
+                const loaded = latest.filter(Boolean)
+                const mixed = pick(interleave(loaded.map(l => l.slice(0, 8))), HOME_FEATURED, 1)
                 const items = mixed.length ? mixed : featuredFromIndex
                 if (items.length) sectionCallback(App.createHomeSection({ id: 'home_featured', title: 'À la une', type: HomeSectionType.featured, items, containsMoreItems: false }))
-                for (const section of held) if (section) sectionCallback(section)
+                const lucky = pick(interleave(loaded.map(l => shuffle(l))), HOME_RANDOM, 5)
+                if (lucky.length >= 5) { randomRow = lucky; sectionCallback(App.createHomeSection({ id: 'home_random', title: 'Au hasard', type: HomeSectionType.singleRowNormal, items: lucky, containsMoreItems: true })) }
+                for (let i = 0; i < held.length; i++) {
+                    const section = held[i]
+                    if (!section) continue
+                    const rest = pick(latest[i] as PartialSourceManga[], 24, 6)
+                    sectionCallback(rest.length ? App.createHomeSection({ id: section.id, title: section.title, type: HomeSectionType.singleRowNormal, items: rest, containsMoreItems: true }) : section)
+                }
+            } else if (randomRow.length === 0) {
+                // Index trop petit pour « Au hasard » : tirage dans les nouveautés des sites
+                const lucky = pick(interleave(latest.filter(Boolean).map(l => shuffle(l))), HOME_RANDOM, 5)
+                if (lucky.length >= 5) sectionCallback(App.createHomeSection({ id: 'home_random', title: 'Au hasard', type: HomeSectionType.singleRowNormal, items: lucky, containsMoreItems: true }))
             }
             await this.debug(`page d'accueil : ${tagRows.length} rangée(s) de tags, ${latest.filter(Boolean).length} site(s) chargé(s), ${this.store.cloudflareBlockedSync().length} bloqué(s) par Cloudflare`)
         } catch (e) {
@@ -521,18 +551,41 @@ export class TagFusion extends Source {
         }
     }
 
-    /** Rangées des tags les plus présents dans l'index (hors tags de format ou de langue) */
-    private async popularTagRows(indexed: (IndexedManga & { id: string })[], info: Record<string, SiteInfo>): Promise<{ key: string, label: string, items: PartialSourceManga[] }[]> {
+    /**
+     * Rangées de tags pour l'accueil : tirées au hasard parmi les tags les plus présents dans l'index
+     * (hors tags de format ou de langue, hors restes de pages présents sur presque toutes les fiches d'un site).
+     */
+    private async popularTagRows(
+        indexed: (IndexedManga & { id: string })[], info: Record<string, SiteInfo>,
+        pick: (pool: PartialSourceManga[], n: number, min: number) => PartialSourceManga[]
+    ): Promise<{ key: string, label: string, items: PartialSourceManga[] }[]> {
         const unified = await this.store.unified()
         const merges = await this.store.customMerges()
-        const candidates = Object.values(unified)
-            .filter(u => u.indexed >= 3 && !GENERIC_TAGS.has(u.key))
+        const keysOf = new Map<string, Set<string>>()
+        for (const m of indexed) keysOf.set(m.id, new Set(m.l.map(l => tagKey(l, merges)).filter((k): k is string => k !== null)))
+        // Restes de page : un « tag » sans page qui figure sur 90 % des fiches d'un site (au moins 10 fiches) et nulle part ailleurs
+        const perSite = new Map<string, { n: number, counts: Map<string, number> }>()
+        for (const m of indexed) {
+            const row = perSite.get(m.s) ?? { n: 0, counts: new Map<string, number>() }
+            row.n++
+            for (const k of keysOf.get(m.id) ?? []) row.counts.set(k, (row.counts.get(k) ?? 0) + 1)
+            perSite.set(m.s, row)
+        }
+        const boilerplate = (key: string): boolean => {
+            const u = unified[key]
+            if (u && Object.values(u.sites).some(t => t.url)) return false
+            const where = [...perSite.entries()].filter(([, r]) => (r.counts.get(key) ?? 0) > 0)
+            return where.length === 1 && where.every(([, r]) => r.n >= 10 && (r.counts.get(key) ?? 0) >= r.n * 0.9)
+        }
+        const top = Object.values(unified)
+            .filter(u => u.indexed >= 3 && !GENERIC_TAGS.has(u.key) && !boilerplate(u.key))
             .sort((a, b) => b.indexed - a.indexed || a.label.localeCompare(b.label))
+            .slice(0, 15)
         const rows: { key: string, label: string, items: PartialSourceManga[] }[] = []
-        for (const u of candidates) {
+        for (const u of shuffle(top)) {
             if (rows.length >= HOME_TAG_ROWS) break
-            const withTag = indexed.filter(m => m.l.some(l => tagKey(l, merges) === u.key))
-            const items = this.indexToPartials(withTag, info, 20)
+            const withTag = indexed.filter(m => keysOf.get(m.id)?.has(u.key))
+            const items = pick(this.indexToPartials(mixBySite(shuffle(withTag)), info, 200), 20, 3)
             if (items.length >= 3) rows.push({ key: u.key, label: (cleanTagLabel(u.label) || u.label).replace(/^\w/, c => c.toUpperCase()).slice(0, 60), items })
         }
         return rows
@@ -569,6 +622,7 @@ export class TagFusion extends Source {
                 const key = safeDecode(homepageSectionId.slice('home_tag_'.length))
                 return await this.doSearch({ includedTags: [App.createTag({ id: tagIdOf(key), label: key })], excludedTags: [], parameters: {} } as SearchRequest, metadata)
             }
+            if (homepageSectionId === 'home_random') return await this.moreRandom(metadata)
             if (homepageSectionId === 'home_featured') {
                 const offset = typeof (metadata as { offset?: unknown } | undefined)?.offset === 'number' ? (metadata as { offset: number }).offset : 0
                 const sites = (await this.store.getSites()).map(siteIdOf)
@@ -602,6 +656,75 @@ export class TagFusion extends Source {
             await this.debug(`voir plus (${homepageSectionId.slice(0, 40)}) : erreur ${e instanceof Error ? e.message : String(e)}`)
             return App.createPagedResults({ results: [] })
         }
+    }
+
+    /**
+     * « Voir plus » de « Au hasard » : tout l'index dans un ordre tiré au hasard (sites mélangés),
+     * puis les catalogues des sites, pris au hasard et page après page. Jamais deux fois le même manga.
+     */
+    private async moreRandom(metadata: unknown): Promise<PagedResults> {
+        const m = (metadata && typeof metadata === 'object' ? metadata : {}) as {
+            seen?: string[], idone?: boolean, cat?: Record<string, { page: number, next?: string, pg?: 'links' | 'guess', start?: string, done?: boolean }>
+            /** Mangas déjà lus sur les catalogues mais pas encore renvoyés (rien n'est perdu d'une page à l'autre) */
+            buf?: { mangaId: string, title: string, image: string, subtitle?: string }[]
+        }
+        const seen = new Set(Array.isArray(m.seen) ? m.seen.filter((x): x is string => typeof x === 'string') : [])
+        const sites = (await this.store.getSites()).map(siteIdOf)
+        const info = await this.store.getSiteInfo()
+        let results: PartialSourceManga[] = []
+        let idone = !!m.idone
+        if (!idone) {
+            const pool = (await this.store.searchIndex([], [], sites)).filter(x => x.i)
+            results = pickDistinct(this.indexToPartials(mixBySite(shuffle(pool)), info, 5000), seen, RANDOM_PAGE, 0)
+            if (results.length < RANDOM_PAGE) idone = true
+        }
+        // Index épuisé : d'abord ce qui reste des catalogues déjà lus, puis les catalogues (3 sites tirés au hasard par appel)
+        const cat = m.cat ?? {}
+        let buf = (Array.isArray(m.buf) ? m.buf : []).filter(x => x && typeof x.mangaId === 'string')
+        if (results.length < RANDOM_PAGE && buf.length) {
+            const fromBuf = pickDistinct(buf.map(x => App.createPartialSourceManga({ mangaId: x.mangaId, title: x.title, image: x.image, ...(x.subtitle ? { subtitle: x.subtitle } : {}) })), seen, RANDOM_PAGE - results.length, 0)
+            const taken = new Set(fromBuf.map(x => x.mangaId))
+            buf = buf.filter(x => !taken.has(x.mangaId) && !seen.has('i' + x.mangaId))
+            results = [...results, ...fromBuf]
+        }
+        if (results.length < RANDOM_PAGE) {
+            const open = shuffle(sites.filter(sid => !cat[sid]?.done)).slice(0, 3)
+            const lists = await Promise.all(open.map(async sid => {
+                const st = cat[sid] ?? (cat[sid] = { page: 0 })
+                try {
+                    const base = await this.baseOf(sid)
+                    const engine = await this.engineOf(sid)
+                    const start = st.start ?? (await this.catalogOf(sid, engine, base) || `${base}/`)
+                    st.start = start
+                    const page = st.page + 1
+                    const res = await this.fetchListing(start, page, st.next, st.pg, engine, base)
+                    if (!res || res.items.length === 0) { st.done = true; return [] }
+                    st.page = page
+                    st.next = res.next
+                    st.pg = res.mode
+                    if (res.mode === 'links' && !res.next) st.done = true
+                    const name = (info[sid]?.name || sid).slice(0, 60)
+                    return shuffle(this.toPartials(sid, res.items)).map(it => App.createPartialSourceManga({ mangaId: it.mangaId, title: it.title, image: it.image, subtitle: name }))
+                } catch { st.done = true; return [] }
+            }))
+            const mixed = interleave(lists)
+            const fresh = pickDistinct(mixed, seen, RANDOM_PAGE - results.length, 0)
+            results = [...results, ...fresh]
+            // Le reste est gardé pour la page suivante
+            const local = new Set<string>()
+            for (const x of mixed) {
+                const keys = dedupeKeys(x)
+                if (keys.some(k => seen.has(k) || local.has(k))) continue
+                for (const k of keys) local.add(k)
+                buf.push({ mangaId: x.mangaId, title: x.title ?? '', image: x.image ?? '', ...(x.subtitle ? { subtitle: x.subtitle } : {}) })
+            }
+            buf = buf.slice(0, 400)
+        }
+        const finished = idone && buf.length === 0 && sites.every(sid => cat[sid]?.done)
+        return App.createPagedResults({
+            results,
+            metadata: finished && results.length === 0 ? undefined : { seen: [...seen].slice(-6000), idone, cat, buf }
+        })
     }
 
     /** Liste du site -> tuiles Paperback, sans doublons et avec des images valides */
@@ -1460,4 +1583,60 @@ export function fillMissingNumbers(nums: number[], names: string[]): number[] {
 
 function isSearchMeta(v: unknown): v is SearchMeta {
     return typeof v === 'object' && v !== null && 'sites' in v && 'seen' in v
+}
+
+/** Mélange (Fisher-Yates) : une copie, l'original n'est pas touché */
+function shuffle<T>(list: T[]): T[] {
+    const a = [...list]
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1))
+        const t = a[i] as T
+        a[i] = a[j] as T
+        a[j] = t
+    }
+    return a
+}
+
+/** Alterne les sites (un manga de chaque site à tour de rôle) en gardant l'ordre de chacun */
+function mixBySite<T extends { s: string }>(list: T[]): T[] {
+    const bySite = new Map<string, T[]>()
+    for (const m of list) { const g = bySite.get(m.s) ?? []; g.push(m); bySite.set(m.s, g) }
+    return interleave(shuffle([...bySite.values()]))
+}
+
+const dedupeKeys = (m: PartialSourceManga): string[] => {
+    const tk = titleKey(m.title ?? '')
+    return tk.length >= 3 ? ['i' + m.mangaId, 't' + tk] : ['i' + m.mangaId]
+}
+
+function unmark(used: Set<string>, m: PartialSourceManga): void {
+    for (const k of dedupeKeys(m)) used.delete(k)
+}
+
+/**
+ * Jusqu'à n mangas encore jamais affichés (ni le même manga, ni le même titre sur un autre site).
+ * S'il en reste moins de min (index encore petit), la rangée est complétée avec des mangas déjà affichés
+ * plutôt que de disparaître.
+ */
+function pickDistinct(pool: PartialSourceManga[], used: Set<string>, n: number, min: number): PartialSourceManga[] {
+    const out: PartialSourceManga[] = []
+    const local = new Set<string>()
+    for (const m of pool) {
+        if (out.length >= n) break
+        const keys = dedupeKeys(m)
+        if (keys.some(k => used.has(k) || local.has(k))) continue
+        for (const k of keys) local.add(k)
+        out.push(m)
+    }
+    if (out.length < min) {
+        for (const m of pool) {
+            if (out.length >= n) break
+            const keys = dedupeKeys(m)
+            if (keys.some(k => local.has(k))) continue
+            for (const k of keys) local.add(k)
+            out.push(m)
+        }
+    }
+    for (const k of local) used.add(k)
+    return out
 }

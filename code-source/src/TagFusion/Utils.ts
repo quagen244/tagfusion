@@ -276,8 +276,18 @@ const JUNK_TAGS = new Set([
     'previous page', 'next page', 'first', 'last', 'top', 'back', 'retour', 'random', 'aleatoire',
     'login', 'log in', 'register', 'sign in', 'sign up', 'connexion', 'inscription', 'upload', 'contact',
     'dmca', 'privacy', 'terms', 'faq', 'discord', 'twitter', 'facebook', 'reddit', 'patreon', 'rss',
-    'bookmark', 'bookmarks', 'favorites', 'favoris', 'history', 'historique', 'settings', 'download', 'telecharger'
+    'bookmark', 'bookmarks', 'favorites', 'favoris', 'history', 'historique', 'settings', 'download', 'telecharger',
+    // boutons et menus des fiches (E-Hentai, nhentai, lecteurs…) qui n'ont rien d'un tag
+    'cancel', 'annuler', 'help', 'aide', 'close', 'fermer', 'ok', 'submit', 'valider', 'save', 'delete', 'edit', 'report',
+    'share', 'partager', 'copy', 'copier', 'open', 'open in new tab', 'open in a new tab', 'new tab', 'ouvrir', 'ouvrir dans un nouvel onglet',
+    'vote up', 'vote down', 'withdraw vote', 'show tagged galleries', 'show tag definition', 'add new tag', 'add tag', 'tag suggestions',
+    'comment', 'comments', 'commentaires', 'reply', 'like', 'dislike', 'follow', 'subscribe', 'torrent', 'torrents', 'archive download',
+    'read online', 'read now', 'start reading', 'lire', 'expand', 'collapse', 'loading', 'none', 'unknown', 'info', 'about',
+    'tier list', 'blacklist', 'add to list', 'add to favorites', 'report gallery', 'petition to expunge', 'petition to rename'
 ])
+
+/** Phrases d'interface (« Show this gallery's tags », « Click here to… ») : jamais des tags */
+const UI_PHRASE = /\b(?:click here|gallery s|gallerys|galleries tags|tags of|this gallery|this manga|ce manga|cette galerie)\b/
 
 /** Vrais tags qui commencent par un chiffre (gardés sur les fiches ; tous les autres sont des restes de pages) */
 const KEEP_NON_ALPHA = new Set(['2d', '3d', '4 koma', '18 plus'])
@@ -341,6 +351,7 @@ function baseTagKey(label: string): string | null {
     const adult = /^(\d{2})\s*\+$/.exec(cleaned)
     let k: string | null = adult ? `${adult[1]} plus` : normalizeTagText(cleaned)
     if (k === '' || k.length > 40 || /^\d+$/.test(k) || JUNK_TAGS.has(k)) k = null
+    else if (k.split(' ').length >= 3 && UI_PHRASE.test(k)) k = null
     // Un tag commence par une lettre (« +22 more pages », « 1 », « » Prev » ne sont pas des tags)
     else if (!/^[a-z]/.test(k) && !KEEP_NON_ALPHA.has(k)) k = null
     if (BASE_KEYS.size > 20000) BASE_KEYS.clear()
