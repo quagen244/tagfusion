@@ -525,3 +525,70 @@ export function sitesFromVersioning(json: unknown): string[] {
     }
     return out
 }
+
+// --- Recherche multi-tags par le moteur de recherche du site --------------------
+
+/** Paramètres de recherche dont la valeur accepte plusieurs termes séparés par des espaces */
+const COMBO_PARAMS = new Set(['q', 's', 'query', 'keyword', 'keywords', 'k', 'search', 'f_search'])
+
+function splitQuery(url: string): { head: string, params: [string, string][] } {
+    const noHash = url.split('#')[0] ?? url
+    const i = noHash.indexOf('?')
+    if (i < 0) return { head: noHash, params: [] }
+    const params: [string, string][] = []
+    for (const part of noHash.slice(i + 1).split('&')) {
+        if (!part) continue
+        const eq = part.indexOf('=')
+        params.push(eq < 0 ? [part, ''] : [part.slice(0, eq), part.slice(eq + 1)])
+    }
+    return { head: noHash.slice(0, i), params }
+}
+
+const decodeParam = (v: string): string => tryDecodeURI(v.replace(/\+/g, ' ')).trim()
+
+/**
+ * Adresse de recherche du site qui demande TOUS ces tags à la fois, quand leurs liens le permettent :
+ *  - liens de recherche ("/?q=tag:%22a%22", "/search?q=a") : même page, termes réunis dans la même recherche ;
+ *  - liens à espace de noms ("/tag/female:big+breasts", type E-Hentai) : recherche "female:"big breasts$" ...".
+ * Ce n'est qu'un point de départ : les résultats sont vérifiés (et la méthode abandonnée si le site l'ignore).
+ * Retourne null si les liens ne s'y prêtent pas.
+ */
+export function searchComboUrl(tagUrls: string[]): string | null {
+    if (tagUrls.length < 2) return null
+    const origin = (u: string): string => (/^https?:\/\/[^/]+/i.exec(u) ?? [''])[0]
+    const o = origin(tagUrls[0] as string)
+    if (!o || !tagUrls.every(u => origin(u).toLowerCase() === o.toLowerCase())) return null
+
+    // 1. Liens de recherche : même chemin, même paramètre de recherche
+    const parsed = tagUrls.map(splitQuery)
+    const head = (parsed[0] as { head: string }).head.replace(/\/+$/, '')
+    if (parsed.every(p => p.head.replace(/\/+$/, '') === head)) {
+        const name = (parsed[0] as { params: [string, string][] }).params.map(([k]) => k).find(k => COMBO_PARAMS.has(k.toLowerCase()))
+        if (name) {
+            const terms: string[] = []
+            for (const p of parsed) {
+                const v = p.params.find(([k]) => k === name)
+                const term = v ? decodeParam(v[1]) : ''
+                if (!term) return null
+                if (!terms.includes(term)) terms.push(term)
+            }
+            const rest = (parsed[0] as { params: [string, string][] }).params
+                .filter(([k]) => k !== name)
+                .map(([k, v]) => `${k}=${v}`)
+            const query = [`${name}=${encodeURIComponent(terms.join(' '))}`, ...rest].join('&')
+            return `${(parsed[0] as { head: string }).head}?${query}`
+        }
+    }
+
+    // 2. Liens "/tag/espace:valeur" (E-Hentai et ses copies)
+    const terms: string[] = []
+    for (const u of tagUrls) {
+        const m = /^https?:\/\/[^/]+\/tags?\/([a-z]+):([^/?#]+)\/?(?:[?#]|$)/i.exec(u)
+        if (!m) return null
+        const value = decodeParam(m[2] as string).replace(/["$]/g, '')
+        if (!value) return null
+        const term = `${(m[1] as string).toLowerCase()}:"${value}$"`
+        if (!terms.includes(term)) terms.push(term)
+    }
+    return `${o}/?f_search=${encodeURIComponent(terms.join(' '))}`
+}

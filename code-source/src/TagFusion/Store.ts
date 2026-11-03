@@ -28,6 +28,8 @@ export interface SiteInfo {
     error?: string
     /** Page du catalogue complet du site ('' = aucune trouvée) */
     catalog?: string
+    /** 'no' : la recherche du site ignore les recherches à plusieurs tags (on ne réessaie plus) */
+    combo?: 'no'
 }
 
 /** Un manga dont on a lu la fiche, avec tous ses tags (liens ou non) */
@@ -269,6 +271,20 @@ export class Store {
         return out.sort((a, b) => b.at - a.at)
     }
 
+    /** Nombre de mangas indexés de ce site qui portent chacun de ces tags (pour partir du tag le plus rare) */
+    async tagCounts(siteId: string, keys: string[]): Promise<Record<string, number>> {
+        const out: Record<string, number> = {}
+        for (const k of keys) out[k] = 0
+        const index = await this.getIndex(true)
+        const merges = await this.customMerges()
+        for (const m of Object.values(index)) {
+            if (m.s !== siteId) continue
+            const ks = new Set(m.l.map(l => tagKey(l, merges)).filter((k): k is string => k !== null))
+            for (const k of keys) if (ks.has(k)) out[k] = (out[k] ?? 0) + 1
+        }
+        return out
+    }
+
     // --- Fusions personnalisées ("love=romance; bl=boys love") ----------------
 
     async getMergesText(): Promise<string> {
@@ -308,7 +324,9 @@ export class Store {
                 const key = tagKey(t.label, merges)
                 if (key === null) continue
                 const u = out[key] ?? (out[key] = { key, label: prettyLabel(key), sites: {}, indexed: 0 })
-                if (!u.sites[siteId]) u.sites[siteId] = t
+                // Plusieurs formes du même tag sur un site : on garde celle qui a une page (et un filtre)
+                const prev = u.sites[siteId]
+                if (!prev || (!prev.url && t.url) || (prev.url && t.url && !prev.filter && t.filter)) u.sites[siteId] = t
                 vote(key, cleanTagLabel(t.label))
             }
         }

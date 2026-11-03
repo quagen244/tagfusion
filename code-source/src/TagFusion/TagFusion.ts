@@ -27,11 +27,11 @@ import { buildSettings } from './Settings'
 import { IndexedManga, SiteInfo, SiteTag, Store, UnifiedTag } from './Store'
 import {
     absoluteUrl, cleanTagLabel, decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
-    mapLimit, safeDate, safeEncode, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, tagKey, titleKey
+    mapLimit, safeDate, safeEncode, searchComboUrl, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, tagKey, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.10.0',
+    version: '1.11.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -54,6 +54,9 @@ interface SearchMeta {
         next?: string, pg?: 'links' | 'guess'
         /** Catalogue : page en cours, position dans la page, adresse résolue, lien suivant, façon de paginer */
         cpage?: number, offset?: number, ccur?: string, cnext?: string, cpg?: 'links' | 'guess'
+        /** Plusieurs tags : point de départ ('filter' = filtre du site, 'combo' = recherche du site avec tous les tags,
+         *  'tag' = page du tag le plus rare, 'catalog' = catalogue), son adresse, et le contrôle de la recherche du site */
+        src?: 'filter' | 'combo' | 'tag' | 'catalog', start?: string, checked?: number, hits?: number, trust?: boolean
     }>
     seen: string[]
     /** Tour de rôle des sites à vérifier fiche par fiche */
@@ -72,6 +75,9 @@ const MAX_SEARCH_TAGS = 500
 const SEARCH_READS = 40
 const SEARCH_TIME_FIRST = 15000
 const SEARCH_TIME_NEXT = 10000
+/** Rallonge quand un appel n'a encore rien trouvé (une page vide arrêterait le défilement) */
+const SEARCH_TIME_EXTRA = 10000
+const SEARCH_READS_EXTRA = 30
 
 /** Contrôle d'une recherche en cours : annulation, fiches restantes, heure limite */
 interface SearchControl { cancelled: () => boolean, reads: number, deadline: number }
@@ -742,7 +748,16 @@ export class TagFusion extends Source {
         // une page trop courte ne remplit pas l'écran, on ne peut pas défiler, et rien d'autre ne charge.
         // Limites : quelques tours, et un temps maximum (au-delà, on renvoie ce qu'on a déjà).
         const wanted = BATCH_SIZE
-        for (let round = 0; round < 12 && results.length < wanted && !ctl.cancelled() && Date.now() < ctl.deadline && ctl.reads > 0; round++) {
+        // Une page vide arrête le défilement dans l'app : si rien n'est trouvé dans le temps prévu
+        // alors qu'il reste des pages à voir, on s'accorde une rallonge (une seule fois).
+        let extended = false
+        for (let round = 0; round < 24 && results.length < wanted && !ctl.cancelled(); round++) {
+            if (Date.now() >= ctl.deadline || ctl.reads <= 0) {
+                if (extended || results.length > 0) break
+                extended = true
+                ctl.deadline = Date.now() + SEARCH_TIME_EXTRA
+                ctl.reads += SEARCH_READS_EXTRA
+            }
             const pending = sites.filter(s => !meta.sites[s]?.done)
             if (pending.length === 0) break
             // Sites avec une page pour le tag (un seul tag, pas d'exclusion) : tous à chaque tour (rapide).
@@ -841,14 +856,21 @@ export class TagFusion extends Source {
      * fiche quand la limite est atteinte : `processed` dit combien ont été traités (on reprendra là).
      */
     private async verifyItems(siteId: string, items: ListingItem[], included: string[], excluded: string[], ctl: SearchControl, title = '')
-        : Promise<{ found: ListingItem[], processed: number }> {
+        : Promise<{ found: ListingItem[], processed: number, checked: number }> {
         const merges = await this.store.customMerges()
         const want = title ? titleKey(title) : ''
+        const keysOf = (labels: string[]): Set<string> => new Set(labels.map(l => tagKey(l, merges)).filter((k): k is string => k !== null))
         // 1. Ce qu'on peut traiter maintenant (dans l'ordre)
         const plan: { item: ListingItem, id: string, labels?: string[], skip?: boolean }[] = []
         for (const item of items) {
             const id = encodeMangaId(siteId, item.url)
             if (want && !titleKey(item.title).includes(want)) { plan.push({ item, id, skip: true }); continue }
+            // Les tags affichés sur la vignette suffisent quand ils contiennent déjà tous les tags demandés
+            // (sans exclusion : la vignette peut ne pas tout montrer, donc elle ne prouve pas l'absence d'un tag)
+            if (item.tags && excluded.length === 0) {
+                const ks = keysOf(item.tags)
+                if (included.every(k => ks.has(k))) { plan.push({ item, id, labels: item.tags }); continue }
+            }
             const indexed = await this.store.getIndexed(id).catch(() => undefined)
             if (indexed) { plan.push({ item, id, labels: indexed.l }); continue }
             if (ctl.cancelled() || ctl.reads <= 0 || Date.now() > ctl.deadline) break
@@ -873,10 +895,10 @@ export class TagFusion extends Source {
         } catch { /* l'enregistrement ne doit pas bloquer la recherche */ }
         const found = plan.filter(p => {
             if (p.skip || !p.labels) return false
-            const keys = new Set(p.labels.map(l => tagKey(l, merges)).filter((k): k is string => k !== null))
+            const keys = keysOf(p.labels)
             return included.every(k => keys.has(k)) && !excluded.some(k => keys.has(k))
         }).map(p => p.item)
-        return { found, processed: plan.length }
+        return { found, processed: plan.length, checked: plan.filter(p => !p.skip && p.labels).length }
     }
 
     /**
@@ -926,29 +948,92 @@ export class TagFusion extends Source {
             const verify = this.needsVerification(siteId, unified, included, excluded)
 
             if (verify) {
-                // Point de départ : page combinée du site si elle existe, sinon page d'un des tags, sinon le catalogue
-                const combined = withPage.length === siteTags.length ? engine.combinedUrl(base, withPage, 1) : null
-                let start = combined ?? (withPage[0] ? engine.listingUrl(withPage[0], 1) : '')
-                state.mode = withPage.length ? 'page du tag + vérification' : 'catalogue'
-                if (!start) {
-                    start = await this.catalogOf(siteId, engine, base)
-                    if (!start) { state.done = true; return [] }
+                // Point de départ, choisi une fois par recherche et par site :
+                //  1. le filtre multi-tags du site ; 2. sa recherche avec tous les tags à la fois ;
+                //  3. la page du tag le plus rare ; 4. le catalogue. Tout ce qui en sort est vérifié.
+                if (!state.src || !state.start) {
+                    // Un des tags n'a jamais été vu sur ce site (ni dans sa liste de tags, ni sur une fiche) :
+                    // inutile de parcourir tout son catalogue pour le chercher
+                    if (included.length > 1 && siteTags.some(t => !t)) {
+                        const missing = included.filter((_, i) => !siteTags[i])
+                        const counts = await this.store.tagCounts(siteId, missing).catch(() => ({} as Record<string, number>))
+                        if (missing.some(k => !counts[k])) { state.done = true; return [] }
+                    }
+                    const allHavePage = withPage.length === siteTags.length
+                    const filter = allHavePage ? engine.combinedUrl(base, withPage, 1) : null
+                    const combo = !filter && allHavePage && included.length > 1 && (await this.store.site(siteId))?.combo !== 'no'
+                        ? searchComboUrl(withPage.map(t => t.url)) : null
+                    if (filter) { state.src = 'filter'; state.start = filter }
+                    else if (combo) { state.src = 'combo'; state.start = combo }
+                    else if (withPage.length) await this.startFromRarestTag(siteId, state, included, siteTags, engine)
+                    else {
+                        const cat = await this.catalogOf(siteId, engine, base)
+                        if (!cat) { state.done = true; return [] }
+                        state.src = 'catalog'; state.start = cat
+                    }
                 }
+                state.mode = state.src === 'filter' ? 'filtre du site + vérification'
+                    : state.src === 'combo' ? (state.trust ? 'recherche du site (fiable)' : 'recherche du site + vérification')
+                    : state.src === 'tag' ? 'page du tag + vérification' : 'catalogue'
                 const cpage = state.cpage ?? 1
                 firstPage = cpage === 1 && !state.offset
                 const offset = state.offset ?? 0
                 ctl.reads--
-                const res = state.ccur
-                    ? await this.fetchListing(state.ccur, 1, undefined, undefined, engine, base)
-                    : await this.fetchListing(start, cpage, state.cnext, state.cpg, engine, base)
-                if (!res) { state.done = true; return [] }
-                if (!state.ccur) { state.ccur = res.url; if (cpage === 1) state.cpg = res.mode }
-                const items = res.items
+                let res: { items: ListingItem[], url: string, next?: string, mode: 'links' | 'guess' } | null
+                try {
+                    res = state.ccur
+                        ? await this.fetchListing(state.ccur, 1, undefined, undefined, engine, base)
+                        : await this.fetchListing(state.start as string, cpage, state.cnext, state.cpg, engine, base)
+                } catch (e) {
+                    // La recherche du site n'existe pas sous cette forme : on n'y revient plus, on part du tag
+                    if (state.src === 'combo' && !(e instanceof Error && /Cloudflare/.test(e.message))) {
+                        await this.store.updateSite(siteId, { combo: 'no' })
+                        await this.startFromRarestTag(siteId, state, included, siteTags, engine)
+                        return []
+                    }
+                    throw e
+                }
+                const items = res?.items ?? []
                 const first = items[0]?.url
-                if (!first || (cpage > 1 && offset === 0 && first === state.firstUrl)) { state.done = true; return [] }
+                if (!res || !first || (cpage > 1 && offset === 0 && first === state.firstUrl)) {
+                    // Recherche du site vide dès la 1re page : on vérifie quand même en partant du tag
+                    if (state.src === 'combo' && cpage === 1 && offset === 0) {
+                        await this.startFromRarestTag(siteId, state, included, siteTags, engine)
+                        return []
+                    }
+                    state.done = true
+                    return []
+                }
+                if (!state.ccur) { state.ccur = res.url; if (cpage === 1) state.cpg = res.mode }
                 if (cpage === 1) state.firstUrl = first
-                const batch = items.slice(offset, offset + CRAWL_BATCH)
-                const { found, processed } = await this.verifyItems(siteId, batch, included, excluded, ctl, title)
+
+                let found: ListingItem[]
+                let processed: number
+                if (state.trust && excluded.length === 0) {
+                    // Recherche du site jugée fiable : toute la page, sans ouvrir les fiches
+                    const rest = items.slice(offset)
+                    found = title ? rest.filter(i => titleKey(i.title).includes(titleKey(title))) : rest
+                    processed = rest.length
+                } else {
+                    const r = await this.verifyItems(siteId, items.slice(offset, offset + CRAWL_BATCH), included, excluded, ctl, title)
+                    found = r.found
+                    processed = r.processed
+                    if (state.src === 'combo' && !state.trust) {
+                        state.checked = (state.checked ?? 0) + r.checked
+                        state.hits = (state.hits ?? 0) + r.found.length
+                        if (state.checked >= 6) {
+                            const ratio = state.hits / state.checked
+                            if (ratio >= 0.8) state.trust = true
+                            else if (ratio < 0.3) {
+                                // Le site ignore la recherche à plusieurs tags : on n'y revient plus
+                                await this.debug(`recherche ${siteId} : recherche du site peu fiable (${state.hits}/${state.checked}), départ du tag`)
+                                await this.store.updateSite(siteId, { combo: 'no' })
+                                await this.startFromRarestTag(siteId, state, included, siteTags, engine)
+                                return found
+                            }
+                        }
+                    }
+                }
                 const nextOffset = offset + processed
                 if (nextOffset >= items.length) {
                     // Page terminée : la suivante sera celle du lien "suivant"
@@ -996,6 +1081,21 @@ export class TagFusion extends Source {
             if (firstPage || /Cloudflare/.test(msg)) await this.store.updateSite(siteId, { error: msg })
             return []
         }
+    }
+
+    /**
+     * Repart de la page du tag le plus rare de ce site (le moins de mangas à vérifier),
+     * en remettant la progression à zéro. Rareté estimée sur les fiches déjà indexées.
+     */
+    private async startFromRarestTag(siteId: string, state: SearchMeta['sites'][string], included: string[], siteTags: (SiteTag | undefined)[], engine: Engine): Promise<void> {
+        const pairs = included.map((k, i) => [k, siteTags[i]] as const).filter((p): p is readonly [string, SiteTag] => !!p[1] && !!p[1].url)
+        const counts = await this.store.tagCounts(siteId, pairs.map(p => p[0])).catch(() => ({} as Record<string, number>))
+        let best = pairs[0]
+        for (const p of pairs) if ((counts[p[0]] ?? 0) < (counts[best?.[0] ?? ''] ?? 0)) best = p
+        for (const k of ['cpage', 'offset', 'ccur', 'cnext', 'cpg', 'firstUrl', 'checked', 'hits', 'trust'] as const) delete state[k]
+        if (!best) { state.done = true; return }
+        state.src = 'tag'
+        state.start = engine.listingUrl(best[1], 1)
     }
 
     // =========================================================================

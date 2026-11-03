@@ -69,8 +69,9 @@ async function main(): Promise<void> {
     assert.equal(r2.metadata, undefined)
     assert.equal(r1.metadata, undefined, 'la recherche Alpha, remplacée, ne continue pas')
     const fiches = requests.filter(isFiche).length
-    assert.ok(fiches <= 45, `trop de fiches lues pendant les 3 recherches : ${fiches}`)
+    assert.ok(fiches <= 75, `trop de fiches lues pendant les 3 recherches : ${fiches}`)
     console.log(`✓ 3 tags touchés coup sur coup : les 2 recherches remplacées s'arrêtent, ${fiches} fiches lues au total (plafond respecté)`)
+    assert.ok(r3.results.length > 0, 'la première page de la recherche à 3 tags n\'est pas vide')
 
     // --- La dernière recherche (Alpha+Beta+Gamma) va jusqu'au bout en faisant défiler ---
     const want3 = new Set(SITES.flatMap(s => [30, 60].map(n => `${s.toUpperCase()} ${n}`)))
@@ -80,14 +81,15 @@ async function main(): Promise<void> {
     while (meta !== undefined && calls < 60) {
         requests.length = 0
         const r = await src.getSearchResults({ includedTags: [t('alpha'), t('beta'), t('gamma')], excludedTags: [] }, meta)
-        assert.ok(requests.filter(isFiche).length <= 40, `appel ${calls} : ${requests.filter(isFiche).length} fiches lues (plafond 40)`)
+        assert.ok(requests.filter(isFiche).length <= 70, `appel ${calls} : ${requests.filter(isFiche).length} fiches lues (plafond 40, 70 avec la rallonge)`)
+        if (r.metadata !== undefined) assert.ok(r.results.length > 0, `appel ${calls} : page vide alors qu'il reste des pages (le défilement s'arrêterait)`)
         got3.push(...r.results.map((m: any) => m.title))
         meta = r.metadata
         calls++
     }
     assert.deepEqual([...new Set(got3)].sort(), [...want3].sort())
     assert.equal(new Set(got3).size, got3.length, 'aucun doublon')
-    console.log(`✓ Alpha + Beta + Gamma : les ${want3.size} mangas des 4 sites trouvés en ${calls} appels, chacun plafonné à 40 fiches`)
+    console.log(`✓ Alpha + Beta + Gamma : les ${want3.size} mangas des 4 sites trouvés en ${calls} appels, chacun plafonné, aucune page vide en cours de route`)
 
     // --- Nouvelle recherche Alpha + Beta : tout vient de l'index (fiches déjà lues), rien n'est perdu ---
     const want2 = new Set(SITES.flatMap(s => [6, 12, 18, 24, 30, 36, 42, 48, 54, 60].map(n => `${s.toUpperCase()} ${n}`)))

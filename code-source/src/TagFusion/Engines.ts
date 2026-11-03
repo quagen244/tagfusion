@@ -13,7 +13,11 @@ import {
 //  - generic  : mode universel par détection automatique, pour tout le reste
 // ---------------------------------------------------------------------------
 
-export interface ListingItem { url: string, title: string, image: string }
+export interface ListingItem {
+    url: string, title: string, image: string
+    /** Tags affichés sur la vignette elle-même (souvent incomplets : servent seulement à accepter sans ouvrir la fiche) */
+    tags?: string[]
+}
 
 export interface Details {
     title: string
@@ -187,6 +191,45 @@ function mergeTags(a: SiteTag[], b: SiteTag[]): SiteTag[] {
     return [...byKey.values()]
 }
 
+/** Classe d'une étiquette de tag sur une vignette ("gt" = E-Hentai, "tag", "tag-item", "genre"...) */
+const CARD_TAG_CLASS = /(^|\s)(gt|gtl|gtw|tags?|tag-item|tag-name|genres?|genre-item)(\s|$)/i
+
+/**
+ * Tags visibles sur la vignette d'un manga dans une liste. Seulement si la vignette ne concerne
+ * qu'UN manga (sinon on lirait les tags des voisins). undefined si aucun.
+ */
+function cardTags<T>($: CheerioAPI, card: Cheerio<T>, mangaUrl: string, pageUrl: string, base: string): string[] | undefined {
+    if (!card.length || card.is('body, html, main, table, tbody, ul, ol, section')) return undefined
+    const mangas = new Set<string>()
+    card.find('a[href]').each((_, x) => {
+        const u = absoluteUrl($(x).attr('href'), pageUrl)
+        if (u && sameHost(u, base) && looksLikeMangaUrl(u)) mangas.add(u.replace(/#.*$/, ''))
+    })
+    if (mangas.size > 1 || (mangas.size === 1 && !mangas.has(mangaUrl))) return undefined
+    const out: string[] = []
+    const push = (raw: string | undefined): void => {
+        const label = cleanTagLabel(clean(raw).replace(/^#/, ''))
+        if (label && label.length <= 40 && !out.includes(label)) out.push(label)
+    }
+    card.find('a[href]').each((_, x) => {
+        const u = absoluteUrl($(x).attr('href'), pageUrl)
+        if (!u || !sameHost(u, base) || !looksLikeTagUrl(u) || NON_GENRE_PATH.test(u) || NON_GENRE_QUERY.test(u)) return
+        push($(x).text())
+    })
+    card.find('div, span, li').each((_, x) => {
+        if (!CARD_TAG_CLASS.test(x.attribs['class'] ?? '')) return
+        if ($(x).find('div, span, li, a').length) return
+        // E-Hentai : title="female:big breasts" ; ailleurs : le texte de l'étiquette
+        const title = clean(x.attribs['title'])
+        const m = /^([a-z]+):(.+)$/i.exec(title)
+        if (m) {
+            if (new RegExp(`^(?:${NON_GENRE_WORDS})s?$`, 'i').test(m[1] as string)) return
+            push(m[2])
+        } else if (!NON_GENRE_LABEL.test(clean($(x).text()))) for (const part of clean($(x).text()).split(/\s*[,;|•·]\s*/)) push(part)
+    })
+    return out.length ? out : undefined
+}
+
 /** Liste de mangas : liens vers des fiches, accompagnés d'une image */
 function genericListing($: CheerioAPI, pageUrl: string, base: string): ListingItem[] {
     const byUrl = new Map<string, ListingItem>()
@@ -206,11 +249,13 @@ function genericListing($: CheerioAPI, pageUrl: string, base: string): ListingIt
         const inner = a.find('.glink, [class*="title"], [class*="caption"]').first()
         const title = clean(a.attr('title')) || clean(inner.text()) || clean(a.find('img').attr('alt')) || clean(heading.text()) || clean(a.text())
         if (!title || title.length > 200) return
+        const tags = cardTags($, card, clean_url, pageUrl, base)
         const prev = byUrl.get(clean_url)
-        if (!prev) byUrl.set(clean_url, { url: clean_url, title, image })
+        if (!prev) byUrl.set(clean_url, { url: clean_url, title, image, ...(tags ? { tags } : {}) })
         else {
             if (!prev.image && image) prev.image = image
             if (prev.title.length < 2 && title) prev.title = title
+            if (!prev.tags && tags) prev.tags = tags
         }
     }
     $('a[href]').each((_, el) => consider(el, true))
