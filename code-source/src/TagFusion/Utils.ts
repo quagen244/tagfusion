@@ -330,16 +330,34 @@ export function normalizeTagText(label: string): string {
  * Clé unifiée d'un tag. `custom` = fusions de l'utilisateur ("love=romance").
  * Retourne null si ce n'est pas un vrai tag.
  */
-export function tagKey(label: string, custom: Record<string, string> = {}): string | null {
+/** Mémoire des clés déjà calculées (les mêmes libellés reviennent des milliers de fois dans l'index) */
+const BASE_KEYS = new Map<string, string | null>()
+
+function baseTagKey(label: string): string | null {
+    const known = BASE_KEYS.get(label)
+    if (known !== undefined) return known
     const cleaned = cleanTagLabel(label)
     // "18+" garde un sens (contenu adulte) : on lui donne une clé lisible
     const adult = /^(\d{2})\s*\+$/.exec(cleaned)
-    let k = adult ? `${adult[1]} plus` : normalizeTagText(cleaned)
-    if (k === '' || k.length > 40 || /^\d+$/.test(k) || JUNK_TAGS.has(k)) return null
+    let k: string | null = adult ? `${adult[1]} plus` : normalizeTagText(cleaned)
+    if (k === '' || k.length > 40 || /^\d+$/.test(k) || JUNK_TAGS.has(k)) k = null
     // Un tag commence par une lettre (« +22 more pages », « 1 », « » Prev » ne sont pas des tags)
-    if (!/^[a-z]/.test(k) && !KEEP_NON_ALPHA.has(k)) return null
+    else if (!/^[a-z]/.test(k) && !KEEP_NON_ALPHA.has(k)) k = null
+    if (BASE_KEYS.size > 20000) BASE_KEYS.clear()
+    BASE_KEYS.set(label, k)
+    return k
+}
+
+export function tagKey(label: string, custom?: Record<string, string>): string | null {
+    const k = baseTagKey(label)
+    if (k === null) return null
     // Les fusions de l'utilisateur passent en premier, puis les synonymes intégrés
-    return custom[k] ?? BUILTIN_SYNONYMS[k] ?? k
+    // (hasOwnProperty : un tag nommé « constructor » ou « toString » ne doit pas tomber sur une fonction)
+    return (custom && hasOwn(custom, k) ? custom[k] : undefined) ?? (hasOwn(BUILTIN_SYNONYMS, k) ? BUILTIN_SYNONYMS[k] : undefined) ?? k
+}
+
+function hasOwn(o: object, k: string): boolean {
+    return Object.prototype.hasOwnProperty.call(o, k)
 }
 
 /** Parse "love=romance; bl = boys love" en dictionnaire normalisé */

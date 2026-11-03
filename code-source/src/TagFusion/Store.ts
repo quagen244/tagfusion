@@ -40,6 +40,8 @@ export interface IndexedManga {
     i: string // image
     l: string[] // libellés des tags, tels qu'affichés sur la fiche
     at: number // date de lecture
+    /** 1 = fiche pas encore lue : seulement les tags vus sur sa vignette dans une liste (sûrs, mais peut-être incomplets) */
+    p?: 1
 }
 
 type RawTags = Record<string, Record<string, SiteTag>> // siteId -> tagTextNormalisé -> SiteTag
@@ -48,14 +50,25 @@ type MangaIndex = Record<string, IndexedManga> // mangaId -> manga
 const K_SITES = 'tf_sites'
 const K_INFO = 'tf_site_info'
 const K_RAW = 'tf_raw_tags'
+/** Ancien index (une seule clé) : relu et réparti dans les morceaux à la première écriture */
 const K_INDEX = 'tf_manga_index'
+/** L'index est découpé en morceaux : une écriture ne réenregistre que les morceaux modifiés */
+const INDEX_SHARDS = 8
+const shardKey = (i: number): string => `tf_manga_index_${i}`
+const K_INDEX_VER = 'tf_manga_index_ver'
+function shardOf(id: string): number {
+    let h = 0
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0
+    return Math.abs(h) % INDEX_SHARDS
+}
 const K_MERGES = 'tf_merges'
 const K_CF = 'tf_cloudflare_blocked'
 
-/** Nombre maximum de mangas gardés dans l'index (les plus anciens partent en premier) */
-const INDEX_LIMIT = 3000
+/** Nombre maximum de mangas gardés dans l'index (les vignettes seules partent en premier, puis les plus anciens) */
+const INDEX_LIMIT = 12000
 /** Durée pendant laquelle on fait confiance à la copie en mémoire avant de relire le stockage */
 const FRESH_MS = 1500
+const INDEX_FRESH_MS = 10000
 
 /**
  * Tout ce que l'extension retient : la liste des sites, ce qu'on sait de chacun,
@@ -70,6 +83,10 @@ export class Store {
     private raw?: { data: RawTags, at: number }
     private info?: { data: Record<string, SiteInfo>, at: number }
     private index?: { data: MangaIndex, at: number }
+    /** L'ancien index (une seule clé) contenait encore des mangas : à répartir dans les morceaux */
+    private legacyIndex = false
+    /** Version de l'index au moment où la copie en mémoire a été lue */
+    private indexVer: unknown
     private unifiedCache?: { forRaw: RawTags, forIndex: MangaIndex, merges: string, rev: number, rawSig: string, indexSig: string, data: Record<string, UnifiedTag> }
     /** Compteur de modifications des tags et de l'index (une copie en mémoire n'est valable que pour la même valeur) */
     private rev = 0
@@ -194,10 +211,24 @@ export class Store {
         })
     }
 
+    /**
+     * Toutes les pages de ce site pour un tag unifié (synonymes fusionnés : "Yuri" et "Girls Love"
+     * peuvent être deux pages différentes du même site). Celle donnée en premier passe d'abord.
+     */
+    async siteVariants(siteId: string, key: string, first?: SiteTag): Promise<SiteTag[]> {
+        const merges = await this.customMerges()
+        const out: SiteTag[] = first?.url ? [first] : []
+        for (const t of Object.values((await this.getRaw())[siteId] ?? {})) {
+            if (!t.url || out.some(o => o.url === t.url)) continue
+            if (tagKey(t.label, merges) === key) out.push(t)
+        }
+        return out
+    }
+
     async clearTags(): Promise<void> {
         await this.serial(async () => {
             await this.state.store(K_RAW, {})
-            await this.state.store(K_INDEX, {})
+            await this.clearIndexKeys()
             this.rev++
             this.raw = { data: {}, at: Date.now() }
             this.index = { data: {}, at: Date.now() }
@@ -211,14 +242,74 @@ export class Store {
     // --- Index des mangas lus (tous leurs tags, même ceux qui ne sont pas des liens) ---
 
     private async getIndex(force = false): Promise<MangaIndex> {
-        if (force || !this.index || Date.now() - this.index.at > FRESH_MS) {
-            this.index = { data: await this.load<MangaIndex>(K_INDEX), at: Date.now() }
+        // L'index est gros : on ne le relit en entier que s'il a changé (petit numéro de version
+        // enregistré à chaque écriture, par n'importe quel exemplaire de l'extension)
+        if (!force && this.index) {
+            const age = Date.now() - this.index.at
+            if (age <= FRESH_MS) return this.index.data
+            if (age <= INDEX_FRESH_MS) {
+                const ver = await this.state.retrieve(K_INDEX_VER)
+                if (ver === this.indexVer) { this.index.at = Date.now() - FRESH_MS; return this.index.data }
+            }
+        }
+        {
+            this.indexVer = await this.state.retrieve(K_INDEX_VER)
+            const data: MangaIndex = {}
+            const legacy = await this.load<MangaIndex>(K_INDEX)
+            this.legacyIndex = Object.keys(legacy).length > 0
+            for (const [id, m] of Object.entries(legacy)) if (isIndexed(m)) data[id] = m
+            for (let i = 0; i < INDEX_SHARDS; i++) {
+                for (const [id, m] of Object.entries(await this.load<MangaIndex>(shardKey(i)))) {
+                    if (!isIndexed(m)) continue
+                    const prev = data[id]
+                    // Le plus récent gagne, une fiche lue gagne toujours sur une simple vignette
+                    if (!prev || (prev.p && !m.p) || (!!prev.p === !!m.p && m.at >= prev.at)) data[id] = m
+                }
+            }
+            this.index = { data, at: Date.now() }
         }
         return this.index.data
     }
 
+    private async clearIndexKeys(): Promise<void> {
+        await this.state.store(K_INDEX, {})
+        for (let i = 0; i < INDEX_SHARDS; i++) await this.state.store(shardKey(i), {})
+        this.legacyIndex = false
+        await this.bumpIndexVer()
+    }
+
+    private async bumpIndexVer(): Promise<void> {
+        const v = `${Date.now()}-${Math.floor(Math.random() * 1e9)}`
+        await this.state.store(K_INDEX_VER, v)
+        this.indexVer = v
+    }
+
+    /** Enregistre les morceaux modifiés (tous, la première fois après l'ancien format) */
+    private async saveIndex(index: MangaIndex, dirty: Set<number>): Promise<void> {
+        const all = this.legacyIndex
+        if (!all && dirty.size === 0) return
+        const buckets: MangaIndex[] = Array.from({ length: INDEX_SHARDS }, () => ({}))
+        for (const [id, m] of Object.entries(index)) (buckets[shardOf(id)] as MangaIndex)[id] = m
+        for (let i = 0; i < INDEX_SHARDS; i++) if (all || dirty.has(i)) await this.state.store(shardKey(i), buckets[i])
+        if (all) { await this.state.store(K_INDEX, {}); this.legacyIndex = false }
+        await this.bumpIndexVer()
+        this.rev++
+    }
+
+    /** Au-delà de la limite : d'abord les vignettes seules, puis les fiches les plus anciennes */
+    private trimIndex(index: MangaIndex, dirty: Set<number>): void {
+        const ids = Object.keys(index)
+        if (ids.length <= INDEX_LIMIT) return
+        ids.sort((a, b) => {
+            const ma = index[a] as IndexedManga, mb = index[b] as IndexedManga
+            if (!!ma.p !== !!mb.p) return ma.p ? -1 : 1
+            return ma.at - mb.at
+        })
+        for (const id of ids.slice(0, ids.length - INDEX_LIMIT)) { delete index[id]; dirty.add(shardOf(id)) }
+    }
+
     async indexSize(): Promise<number> {
-        return Object.keys(await this.getIndex(true)).length
+        return Object.values(await this.getIndex(true)).filter(m => !m.p).length
     }
 
     /** Enregistre (ou met à jour) un manga et tous ses tags. Retourne true si ses tags ont changé. */
@@ -227,28 +318,52 @@ export class Store {
     }
 
     /**
-     * Enregistre plusieurs mangas en UNE seule écriture (l'index peut être gros : l'écrire
-     * à chaque fiche serait lent et lourd en mémoire). Retourne le nombre de mangas modifiés.
+     * Enregistre plusieurs mangas (fiches lues) en UNE seule écriture, en ne réécrivant que
+     * les morceaux de l'index concernés. Retourne le nombre de mangas modifiés.
      */
-    async indexMany(list: { id: string, entry: Omit<IndexedManga, 'at'> }[]): Promise<number> {
+    async indexMany(list: { id: string, entry: Omit<IndexedManga, 'at' | 'p'> }[]): Promise<number> {
         if (list.length === 0) return 0
         return this.serial(async () => {
             const index = await this.getIndex(true)
+            const dirty = new Set<number>()
             let changed = 0
             const now = Date.now()
             for (const { id, entry } of list) {
                 const labels = [...new Set(entry.l.map(cleanTagLabel).filter(l => tagKey(l) !== null))]
                 const prev = index[id]
-                if (!prev || prev.l.join('|') !== labels.join('|')) changed++
+                if (!prev || prev.p || prev.l.join('|') !== labels.join('|')) changed++
                 index[id] = { s: entry.s, u: entry.u, t: entry.t.slice(0, 200), i: entry.i, l: labels, at: now }
+                dirty.add(shardOf(id))
             }
-            const ids = Object.keys(index)
-            if (ids.length > INDEX_LIMIT) {
-                ids.sort((a, b) => (index[a]?.at ?? 0) - (index[b]?.at ?? 0))
-                for (const id of ids.slice(0, ids.length - INDEX_LIMIT)) delete index[id]
+            this.trimIndex(index, dirty)
+            await this.saveIndex(index, dirty)
+            return changed
+        })
+    }
+
+    /**
+     * Retient les tags vus sur la vignette de mangas dont la fiche n'a pas été lue.
+     * Une fiche déjà lue n'est jamais remplacée ; une vignette déjà vue est complétée.
+     */
+    async notePartial(list: { id: string, entry: Omit<IndexedManga, 'at' | 'p'> }[]): Promise<number> {
+        if (list.length === 0) return 0
+        return this.serial(async () => {
+            const index = await this.getIndex(true)
+            const dirty = new Set<number>()
+            const now = Date.now()
+            let changed = 0
+            for (const { id, entry } of list) {
+                const prev = index[id]
+                if (prev && !prev.p) continue
+                const labels = [...new Set([...(prev?.l ?? []), ...entry.l.map(cleanTagLabel)].filter(l => tagKey(l) !== null))]
+                if (labels.length === 0) continue
+                if (prev && labels.length === prev.l.length) continue
+                index[id] = { s: entry.s, u: entry.u, t: (entry.t || prev?.t || '').slice(0, 200), i: entry.i || prev?.i || '', l: labels, at: now, p: 1 }
+                dirty.add(shardOf(id))
+                changed++
             }
-            await this.state.store(K_INDEX, index)
-            this.rev++
+            this.trimIndex(index, dirty)
+            await this.saveIndex(index, dirty)
             return changed
         })
     }
@@ -259,12 +374,14 @@ export class Store {
     }
 
     /** Mangas indexés qui ont tous les tags demandés et aucun des tags exclus */
-    async searchIndex(included: string[], excluded: string[], sites?: string[]): Promise<(IndexedManga & { id: string })[]> {
+    async searchIndex(included: string[], excluded: string[], sites?: string[], onlyRead = false): Promise<(IndexedManga & { id: string })[]> {
         const index = await this.getIndex(true)
         const merges = await this.customMerges()
         const out: (IndexedManga & { id: string })[] = []
         for (const [id, m] of Object.entries(index)) {
             if (sites && !sites.includes(m.s)) continue
+            // Vignette seule : ses tags peuvent être incomplets, elle ne prouve donc pas l'absence d'un tag exclu
+            if (m.p && (onlyRead || excluded.length > 0 || included.length === 0)) continue
             const keys = new Set(m.l.map(l => tagKey(l, merges)).filter((k): k is string => k !== null))
             if (included.every(k => keys.has(k)) && !excluded.some(k => keys.has(k))) out.push({ ...m, id })
         }
@@ -275,12 +392,31 @@ export class Store {
     async tagCounts(siteId: string, keys: string[]): Promise<Record<string, number>> {
         const out: Record<string, number> = {}
         for (const k of keys) out[k] = 0
-        const index = await this.getIndex(true)
+        const index = await this.getIndex()
         const merges = await this.customMerges()
         for (const m of Object.values(index)) {
             if (m.s !== siteId) continue
             const ks = new Set(m.l.map(l => tagKey(l, merges)).filter((k): k is string => k !== null))
             for (const k of keys) if (ks.has(k)) out[k] = (out[k] ?? 0) + 1
+        }
+        return out
+    }
+
+    /** Comme tagCounts, pour plusieurs sites en un seul passage sur l'index : site -> tag -> nombre */
+    async tagCountsBySite(wanted: Record<string, string[]>): Promise<Record<string, Record<string, number>>> {
+        const out: Record<string, Record<string, number>> = {}
+        for (const [site, keys] of Object.entries(wanted)) { out[site] = {}; for (const k of keys) (out[site] as Record<string, number>)[k] = 0 }
+        if (Object.keys(out).length === 0) return out
+        const index = await this.getIndex()
+        const merges = await this.customMerges()
+        for (const m of Object.values(index)) {
+            const keys = wanted[m.s]
+            if (!keys) continue
+            const row = out[m.s] as Record<string, number>
+            for (const l of m.l) {
+                const k = tagKey(l, merges)
+                if (k !== null && Object.prototype.hasOwnProperty.call(row, k)) row[k] = (row[k] ?? 0) + 1
+            }
         }
         return out
     }
@@ -431,7 +567,8 @@ export class Store {
      */
     async resetAll(full: boolean): Promise<void> {
         await this.serial(async () => {
-            for (const k of [K_RAW, K_INDEX, K_INFO, 'tf_pages_cache']) await this.state.store(k, {})
+            for (const k of [K_RAW, K_INFO, 'tf_pages_cache']) await this.state.store(k, {})
+            await this.clearIndexKeys()
             this.rev++
             await this.state.store(K_CF, [])
             await this.state.store('tf_debug', [])
@@ -509,4 +646,10 @@ export class Store {
             await this.state.store(K_CF, next)
         })
     }
+}
+
+function isIndexed(m: unknown): m is IndexedManga {
+    if (!m || typeof m !== 'object') return false
+    const o = m as Record<string, unknown>
+    return typeof o['s'] === 'string' && typeof o['u'] === 'string' && Array.isArray(o['l']) && typeof o['at'] === 'number'
 }

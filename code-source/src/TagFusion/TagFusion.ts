@@ -31,7 +31,7 @@ import {
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.11.0',
+    version: '1.12.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -57,7 +57,13 @@ interface SearchMeta {
         /** Plusieurs tags : point de départ ('filter' = filtre du site, 'combo' = recherche du site avec tous les tags,
          *  'tag' = page du tag le plus rare, 'catalog' = catalogue), son adresse, et le contrôle de la recherche du site */
         src?: 'filter' | 'combo' | 'tag' | 'catalog', start?: string, checked?: number, hits?: number, trust?: boolean
+        /** Pages du même tag sur ce site (synonymes) : adresses et celle en cours */
+        vs?: string[], v?: number
+        /** Échecs d'affilée (le site est abandonné pour cette recherche au 3e) */
+        fails?: number
     }>
+    /** Index : position (date, identifiant) du dernier manga renvoyé, date de début de la recherche, index fini */
+    iat?: number, iid?: string, icut?: number, idone?: boolean
     seen: string[]
     /** Tour de rôle des sites à vérifier fiche par fiche */
     cursor?: number
@@ -72,7 +78,7 @@ const POLITE_SITES = new Set(['e-hentai.org', 'exhentai.org'])
 /** Nombre maximum de tags affichés sur l'écran de recherche */
 const MAX_SEARCH_TAGS = 500
 /** Recherche : fiches lues au plus par appel, et temps maximum par appel (premier / suivants) */
-const SEARCH_READS = 40
+const SEARCH_READS = 60
 const SEARCH_TIME_FIRST = 15000
 const SEARCH_TIME_NEXT = 10000
 /** Rallonge quand un appel n'a encore rien trouvé (une page vide arrêterait le défilement) */
@@ -80,7 +86,11 @@ const SEARCH_TIME_EXTRA = 10000
 const SEARCH_READS_EXTRA = 30
 
 /** Contrôle d'une recherche en cours : annulation, fiches restantes, heure limite */
-interface SearchControl { cancelled: () => boolean, reads: number, deadline: number }
+interface SearchControl {
+    cancelled: () => boolean, reads: number, deadline: number
+    /** Tags vus sur les vignettes pendant cet appel (enregistrés en une fois à la fin) */
+    notes?: Map<string, { id: string, entry: Omit<IndexedManga, 'at' | 'p'> }>
+}
 /** Accueil : nombre de mangas du carrousel « À la une » et nombre de rangées de tags */
 const HOME_FEATURED = 12
 const HOME_TAG_ROWS = 5
@@ -91,8 +101,10 @@ const GENERIC_TAGS = new Set(['english', 'japanese', 'chinese', 'korean', 'frenc
 /** Nombre de mangas visé par page de résultats (de quoi remplir l'écran et pouvoir faire défiler) */
 const BATCH_SIZE = 24
 /** Parcours d'un catalogue : fiches lues par site et par tour, et sites parcourus par tour */
-const CRAWL_BATCH = 10
-const CRAWL_SITES_PER_ROUND = 2
+const CRAWL_BATCH = 15
+const CRAWL_SITES_PER_ROUND = 4
+/** Mangas de l'index renvoyés au plus par page de résultats (l'index est parcouru en entier, page après page) */
+const INDEX_PAGE = 60
 /** Durée maximum d'une action lancée depuis les réglages */
 const SETTINGS_BUDGET_MS = 25000
 
@@ -136,6 +148,8 @@ export class TagFusion extends Source {
     private htmlCache = new Map<string, { html: string, at: number }>()
     /** Identifiant de la recherche la plus récente : les plus anciennes s'arrêtent d'elles-mêmes */
     private latestSearch = 0
+    /** Mangas déjà renvoyés pour chaque recherche récente (sans limite, contrairement à la copie dans metadata) */
+    private seenByGen = new Map<number, Set<string>>()
     private detailsCache = new Map<string, Details>()
     private cachedUserAgent?: string
 
@@ -573,6 +587,10 @@ export class TagFusion extends Source {
             const res = await this.fetchListing(start, page, m.next, m.pg, engine, base)
             if (!res) return App.createPagedResults({ results: [] })
             const seen = new Set(m.seen ?? [])
+            // Tags affichés sur les vignettes : retenus pour les recherches
+            const notes: SearchControl = { cancelled: () => false, reads: 0, deadline: 0, notes: new Map() }
+            this.noteCards(notes, siteId, res.items)
+            await this.flushNotes(notes)
             const results = this.toPartials(siteId, res.items).filter(r => !seen.has(r.mangaId))
             for (const r of results) seen.add(r.mangaId)
             const finished = results.length === 0 || (res.mode === 'links' && !res.next)
@@ -713,34 +731,70 @@ export class TagFusion extends Source {
         const ctl: SearchControl = {
             cancelled: () => this.latestSearch > gen,
             reads: SEARCH_READS,
-            deadline: Date.now() + (isNew ? SEARCH_TIME_FIRST : SEARCH_TIME_NEXT)
+            deadline: Date.now() + (isNew ? SEARCH_TIME_FIRST : SEARCH_TIME_NEXT),
+            notes: new Map()
         }
         if (ctl.cancelled()) return App.createPagedResults({ results: [] })
-        const seen = new Set(meta.seen)
+        // Déjà renvoyés : la liste complète est gardée en mémoire pour cette recherche
+        // (la copie dans metadata est bornée et ne sert que si l'extension a été relancée entre deux pages)
+        const seen = this.seenByGen.get(gen) ?? new Set<string>()
+        for (const k of meta.seen) seen.add(k)
+        this.seenByGen.set(gen, seen)
+        for (const g of [...this.seenByGen.keys()]) if (this.seenByGen.size > 4 && g !== gen) this.seenByGen.delete(g)
         const results: PartialSourceManga[] = []
         const ids = new Set<string>()
+        const info0 = await this.store.getSiteInfo()
 
-        // Première page : d'abord les mangas de l'index qui ont ces tags (y compris les tags
-        // qui ne sont pas des liens sur le site, donc introuvables autrement)
-        if (!isSearchMeta(metadata) && included.length > 0) {
-            const info = await this.store.getSiteInfo()
-            let local = await this.store.searchIndex(included, excluded, sites)
+        // 1. L'index d'abord, en entier, page après page : mangas dont on connaît déjà les tags
+        //    (y compris les tags qui ne sont pas des liens sur le site, donc introuvables autrement)
+        if (included.length === 0) meta.idone = true
+        if (!meta.idone) {
+            const cut = meta.icut ?? Date.now()
+            meta.icut = cut
+            let local = (await this.store.searchIndex(included, excluded, sites)).filter(m => m.at <= cut)
             if (title) local = local.filter(m => titleKey(m.t).includes(titleKey(title)))
-            for (const m of local.slice(0, 100)) {
+            // Ordre stable (date puis identifiant) : la suite reprend exactement après le dernier renvoyé
+            local.sort((a, b) => (b.at - a.at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+            let i = 0
+            if (meta.iat !== undefined) {
+                const iat = meta.iat, iid = meta.iid ?? ''
+                while (i < local.length && ((local[i] as IndexedManga).at > iat || ((local[i] as IndexedManga).at === iat && (local[i] as { id: string }).id <= iid))) i++
+            }
+            let added = 0
+            for (; i < local.length && added < INDEX_PAGE; i++) {
+                const m = local[i] as IndexedManga & { id: string }
+                meta.iat = m.at
+                meta.iid = m.id
                 const tk = titleKey(m.t)
                 const dedupe = tk.length >= 3 ? 't' + tk : 'i' + m.id
-                if (ids.has(m.id) || seen.has(dedupe)) continue
+                if (ids.has(m.id) || seen.has(dedupe) || seen.has('i' + m.id)) continue
                 ids.add(m.id)
                 seen.add(dedupe)
                 seen.add('i' + m.id)
+                added++
                 results.push(App.createPartialSourceManga({
                     mangaId: m.id,
                     title: m.t || 'Sans titre',
                     image: safeUrl(m.i),
-                    subtitle: (info[m.s]?.name || m.s).slice(0, 60)
+                    subtitle: (info0[m.s]?.name || m.s).slice(0, 60)
                 }))
             }
-            await this.debug(`recherche : ${results.length} manga(s) trouvé(s) dans l'index`)
+            if (i >= local.length) meta.idone = true
+            await this.debug(`recherche : ${added} manga(s) de l'index${meta.idone ? '' : ' (suite à la page suivante)'}`)
+        }
+
+        // 2. Les sites, chacun fouillé jusqu'au bout au fil du défilement.
+        //    Un site qui n'a jamais montré un des tags (ni dans ses tags, ni sur une fiche lue) passe en dernier :
+        //    il est quand même fouillé, mais seulement quand tous les autres sont finis.
+        const lastResort = new Set<string>()
+        if (included.length > 0) {
+            const missingBySite: Record<string, string[]> = {}
+            for (const s of sites) {
+                const missing = included.filter(k => !unified[k]?.sites[s])
+                if (missing.length) missingBySite[s] = missing
+            }
+            const counts = await this.store.tagCountsBySite(missingBySite).catch(() => ({} as Record<string, Record<string, number>>))
+            for (const [s, missing] of Object.entries(missingBySite)) if (missing.some(k => !counts[s]?.[k])) lastResort.add(s)
         }
 
         // On remplit la page avec une vraie fournée (BATCH_SIZE mangas) prise sur tous les sites.
@@ -751,17 +805,19 @@ export class TagFusion extends Source {
         // Une page vide arrête le défilement dans l'app : si rien n'est trouvé dans le temps prévu
         // alors qu'il reste des pages à voir, on s'accorde une rallonge (une seule fois).
         let extended = false
-        for (let round = 0; round < 24 && results.length < wanted && !ctl.cancelled(); round++) {
+        for (let round = 0; round < 30 && results.length < wanted && !ctl.cancelled(); round++) {
             if (Date.now() >= ctl.deadline || ctl.reads <= 0) {
                 if (extended || results.length > 0) break
                 extended = true
                 ctl.deadline = Date.now() + SEARCH_TIME_EXTRA
                 ctl.reads += SEARCH_READS_EXTRA
             }
-            const pending = sites.filter(s => !meta.sites[s]?.done)
-            if (pending.length === 0) break
+            const notDone = sites.filter(s => !meta.sites[s]?.done)
+            if (notDone.length === 0) break
+            const firstChoice = notDone.filter(s => !lastResort.has(s))
+            const pending = firstChoice.length ? firstChoice : notDone
             // Sites avec une page pour le tag (un seul tag, pas d'exclusion) : tous à chaque tour (rapide).
-            // Sites à vérifier fiche par fiche (plusieurs tags, exclusion, pas de page) : 2 par tour, à tour de rôle.
+            // Sites à vérifier fiche par fiche (plusieurs tags, exclusion, pas de page) : 4 par tour, à tour de rôle.
             const crawl = pending.filter(s => this.needsVerification(s, unified, included, excluded))
             const fast = pending.filter(s => !crawl.includes(s))
             const cursor = meta.cursor ?? 0
@@ -796,15 +852,35 @@ export class TagFusion extends Source {
             results.push(...interleave(lists))
         }
 
+        // Tags vus sur les vignettes : retenus pour les prochaines recherches (même si celle-ci est remplacée)
+        await this.flushNotes(ctl)
         if (ctl.cancelled()) {
             await this.debug('recherche : remplacée par une plus récente, arrêtée')
             return App.createPagedResults({ results: [] })
         }
-        // On garde seulement les clés récentes pour que la pagination reste légère
+        // Copie bornée dans metadata (la liste complète reste en mémoire)
         meta.seen = [...seen].slice(-3000)
-        const finished = sites.every(s => meta.sites[s]?.done)
+        const finished = !!meta.idone && sites.every(s => meta.sites[s]?.done)
         await this.debug(`recherche : ${results.length} résultat(s) renvoyé(s) à l'app, ${finished ? 'fin de liste' : 'encore des pages'}`)
         return App.createPagedResults({ results, metadata: finished ? undefined : meta })
+    }
+
+    /** Retient les tags affichés sur les vignettes d'une liste (sans ouvrir les fiches) */
+    private noteCards(ctl: SearchControl | undefined, siteId: string, items: ListingItem[]): void {
+        if (!ctl?.notes) return
+        for (const it of items) {
+            if (!it.tags?.length) continue
+            const id = encodeMangaId(siteId, it.url)
+            const prev = ctl.notes.get(id)
+            if (prev) { for (const l of it.tags) if (!prev.entry.l.includes(l)) prev.entry.l.push(l); continue }
+            ctl.notes.set(id, { id, entry: { s: siteId, u: it.url, t: it.title, i: it.image, l: [...it.tags] } })
+        }
+    }
+
+    private async flushNotes(ctl: SearchControl): Promise<void> {
+        if (!ctl.notes?.size) return
+        try { await this.store.notePartial([...ctl.notes.values()]) } catch { /* sans gravité */ }
+        ctl.notes.clear()
     }
 
     /** Petit journal visible dans les réglages, pour savoir où ça coince */
@@ -872,7 +948,15 @@ export class TagFusion extends Source {
                 if (included.every(k => ks.has(k))) { plan.push({ item, id, labels: item.tags }); continue }
             }
             const indexed = await this.store.getIndexed(id).catch(() => undefined)
-            if (indexed) { plan.push({ item, id, labels: indexed.l }); continue }
+            if (indexed && !indexed.p) { plan.push({ item, id, labels: indexed.l }); continue }
+            if (indexed?.p) {
+                // Vignette déjà vue : suffit pour accepter (tous les tags, aucun exclu demandé)
+                // ou pour refuser (un tag exclu y figure) ; sinon il faut lire la fiche
+                const ks = keysOf(indexed.l)
+                if (excluded.some(k => ks.has(k)) || (excluded.length === 0 && included.every(k => ks.has(k)))) {
+                    plan.push({ item, id, labels: indexed.l }); continue
+                }
+            }
             if (ctl.cancelled() || ctl.reads <= 0 || Date.now() > ctl.deadline) break
             ctl.reads--
             plan.push({ item, id })
@@ -880,7 +964,7 @@ export class TagFusion extends Source {
         // 2. Lecture des fiches nécessaires (4 à la fois), rien de nouveau si la recherche est annulée
         const newEntries: { id: string, entry: { s: string, u: string, t: string, i: string, l: string[] } }[] = []
         const newTags: SiteTag[] = []
-        await mapLimit(plan.filter(p => !p.skip && !p.labels), 4, async p => {
+        await mapLimit(plan.filter(p => !p.skip && !p.labels), 6, async p => {
             if (ctl.cancelled()) return
             try {
                 const d = await this.fetchDetails(siteId, p.item.url, false)
@@ -913,9 +997,10 @@ export class TagFusion extends Source {
         for (const url of candidates) {
             let html: string
             try { html = await this.fetcher.get(url) } catch (e) {
-                // Cloudflare : on remonte l'erreur (le site doit être débloqué) ; une page absente : format suivant
-                if (e instanceof Error && /Cloudflare/.test(e.message)) throw e
-                if (page === 1) throw e
+                // Page absente (4xx) : fin de liste ou format suivant. Toute autre erreur (Cloudflare,
+                // coupure, serveur en panne) remonte : la page sera redemandée au lieu d'arrêter le site.
+                const absent = e instanceof Error && /a répondu 4\d\d/.test(e.message) && !/Cloudflare/.test(e.message)
+                if (page === 1 || !absent) throw e
                 continue
             }
             const $ = this.fetcher.load(html)
@@ -952,16 +1037,14 @@ export class TagFusion extends Source {
                 //  1. le filtre multi-tags du site ; 2. sa recherche avec tous les tags à la fois ;
                 //  3. la page du tag le plus rare ; 4. le catalogue. Tout ce qui en sort est vérifié.
                 if (!state.src || !state.start) {
-                    // Un des tags n'a jamais été vu sur ce site (ni dans sa liste de tags, ni sur une fiche) :
-                    // inutile de parcourir tout son catalogue pour le chercher
-                    if (included.length > 1 && siteTags.some(t => !t)) {
-                        const missing = included.filter((_, i) => !siteTags[i])
-                        const counts = await this.store.tagCounts(siteId, missing).catch(() => ({} as Record<string, number>))
-                        if (missing.some(k => !counts[k])) { state.done = true; return [] }
-                    }
                     const allHavePage = withPage.length === siteTags.length
                     const filter = allHavePage ? engine.combinedUrl(base, withPage, 1) : null
-                    const combo = !filter && allHavePage && included.length > 1 && (await this.store.site(siteId))?.combo !== 'no'
+                    // (pas si un des tags a plusieurs pages sur ce site : la recherche n'en couvrirait qu'une)
+                    let single = true
+                    if (allHavePage) for (let i = 0; i < included.length; i++) {
+                        if ((await this.store.siteVariants(siteId, included[i] as string, siteTags[i])).length > 1) { single = false; break }
+                    }
+                    const combo = !filter && allHavePage && single && included.length > 1 && (await this.store.site(siteId))?.combo !== 'no'
                         ? searchComboUrl(withPage.map(t => t.url)) : null
                     if (filter) { state.src = 'filter'; state.start = filter }
                     else if (combo) { state.src = 'combo'; state.start = combo }
@@ -1001,11 +1084,13 @@ export class TagFusion extends Source {
                         await this.startFromRarestTag(siteId, state, included, siteTags, engine)
                         return []
                     }
-                    state.done = true
+                    this.nextVariantOrDone(state, engine)
                     return []
                 }
                 if (!state.ccur) { state.ccur = res.url; if (cpage === 1) state.cpg = res.mode }
                 if (cpage === 1) state.firstUrl = first
+                this.noteCards(ctl, siteId, items)
+                state.fails = 0
 
                 let found: ListingItem[]
                 let processed: number
@@ -1041,7 +1126,7 @@ export class TagFusion extends Source {
                     state.offset = 0
                     state.ccur = undefined
                     state.cnext = res.next
-                    if (state.cpg === 'links' && !res.next) state.done = true
+                    if (state.cpg === 'links' && !res.next) this.nextVariantOrDone(state, engine)
                 } else state.offset = nextOffset
                 if (processed) await this.debug(`recherche ${siteId} : ${state.mode} p.${cpage} (${offset + 1}-${nextOffset}), ${found.length} trouvé(s)`)
                 return found
@@ -1056,29 +1141,50 @@ export class TagFusion extends Source {
                 state.mode = 'titre'
             } else {
                 const combined = engine.combinedUrl(base, withPage, 1)
-                firstUrl = combined ?? engine.listingUrl(withPage[0] as SiteTag, 1)
-                state.mode = combined ? 'filtre multi-tags' : 'page du tag'
+                if (combined) {
+                    firstUrl = combined
+                    state.mode = 'filtre multi-tags'
+                } else {
+                    // Un seul tag : toutes ses pages sur ce site (synonymes fusionnés), l'une après l'autre
+                    if (!state.vs) {
+                        const variants = await this.store.siteVariants(siteId, included[0] as string, withPage[0]).catch(() => [withPage[0] as SiteTag])
+                        state.vs = variants.map(t => engine.listingUrl(t, 1))
+                        state.v = 0
+                    }
+                    firstUrl = state.vs[state.v ?? 0] ?? engine.listingUrl(withPage[0] as SiteTag, 1)
+                    state.mode = state.vs.length > 1 ? `page du tag (${(state.v ?? 0) + 1}/${state.vs.length})` : 'page du tag'
+                }
             }
             ctl.reads--
             const res = await this.fetchListing(firstUrl, page, state.next, state.pg, engine, base)
-            if (!res) { state.done = true; return [] }
+            if (!res) { this.nextVariantOrDone(state); return [] }
             state.page = page
             state.pg = res.mode
             state.next = res.next
+            state.fails = 0
             let items = res.items
             // Fin de liste : page vide, ou le site renvoie encore la page 1
             const first = items[0]?.url
-            if (!first || (page > 1 && first === state.firstUrl)) { state.done = true; return [] }
+            if (!first || (page > 1 && first === state.firstUrl)) { this.nextVariantOrDone(state); return [] }
             if (page === 1) state.firstUrl = first
+            this.noteCards(ctl, siteId, items)
             // Pagination par liens et plus de lien "suivant" : c'était la dernière page
-            if (res.mode === 'links' && !res.next) state.done = true
+            if (res.mode === 'links' && !res.next) this.nextVariantOrDone(state)
             if (title && included.length > 0) items = items.filter(i => titleKey(i.title).includes(titleKey(title)))
             return items
         } catch (e) {
-            state.done = true
-            // Seule une vraie panne (première page, Cloudflare) est notée comme erreur du site
             const msg = e instanceof Error ? e.message : String(e)
-            if (firstPage || /Cloudflare/.test(msg)) await this.store.updateSite(siteId, { error: msg })
+            // Cloudflare, ou le tout premier appel au site qui échoue : vraie panne, notée dans l'état du site
+            const veryFirst = firstPage && !state.v && !state.cpage && !state.page
+            if (/Cloudflare/.test(msg) || veryFirst) {
+                state.done = true
+                await this.store.updateSite(siteId, { error: msg })
+                return []
+            }
+            // Panne passagère en cours de route : on réessaie (au tour suivant) jusqu'à 3 fois d'affilée
+            state.fails = (state.fails ?? 0) + 1
+            if (state.fails >= 3) { state.fails = 0; this.nextVariantOrDone(state) }
+            await this.debug(`recherche ${siteId} : échec (${msg.slice(0, 60)}), ${state.done ? 'abandon' : 'nouvel essai'}`)
             return []
         }
     }
@@ -1095,7 +1201,27 @@ export class TagFusion extends Source {
         for (const k of ['cpage', 'offset', 'ccur', 'cnext', 'cpg', 'firstUrl', 'checked', 'hits', 'trust'] as const) delete state[k]
         if (!best) { state.done = true; return }
         state.src = 'tag'
-        state.start = engine.listingUrl(best[1], 1)
+        // Toutes les pages de ce tag sur le site (synonymes), l'une après l'autre
+        const variants = await this.store.siteVariants(siteId, best[0], best[1]).catch(() => [best[1]])
+        state.vs = variants.map(t => engine.listingUrl(t, 1))
+        state.v = 0
+        state.start = state.vs[0] ?? engine.listingUrl(best[1], 1)
+    }
+
+    /** Liste finie : on passe à la page suivante du même tag (synonyme) s'il y en a, sinon le site est fini */
+    private nextVariantOrDone(state: SearchMeta['sites'][string], _engine?: Engine): void {
+        const v = (state.v ?? 0) + 1
+        if (state.vs && v < state.vs.length) {
+            state.v = v
+            state.start = state.vs[v]
+            // Mode simple : progression de la liste
+            state.page = 0
+            delete state.next; delete state.pg
+            // Mode vérifié : progression du parcours
+            for (const k of ['cpage', 'offset', 'ccur', 'cnext', 'cpg', 'firstUrl'] as const) delete state[k]
+            return
+        }
+        state.done = true
     }
 
     // =========================================================================

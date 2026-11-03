@@ -169,10 +169,13 @@ async function main(): Promise<void> {
     // 6. Tous les sites à la fois : chaque site trouve ses mangas, sans doublon ni page vide en route
     const all = await run([t('romance'), t('action')])
     assert.deepEqual(all.titles.sort(), [...wantWp, 'NF 12', 'NF 6'].sort())
-    assert.ok(!requests.some(u => /hentainexus\.com|e-hentai\.org|rare\.test/.test(u)), `sites sans ces tags parcourus : ${requests.filter(u => /hentainexus|e-hentai|rare\.test/.test(u)).slice(0, 3).join(', ')}`)
+    // Les sites qui n'ont jamais montré ces tags sont quand même fouillés, mais seulement après les autres
+    const firstLast = requests.findIndex(u => /hentainexus\.com|e-hentai\.org|rare\.test/.test(u))
+    const lastMain = requests.length - 1 - [...requests].reverse().findIndex(u => /wp\.test|nf\.test/.test(u))
+    assert.ok(firstLast === -1 || firstLast > lastMain, `ordre : site sans ces tags fouillé (${firstLast}) avant la fin des autres (${lastMain})`)
     const allEh = await run([t('big breasts'), t('glasses')])
     for (const n of [100, 124, 200, 209]) assert.ok(allEh.titles.includes(`EH Gallery ${n}`), `manque EH Gallery ${n}`)
-    console.log(`✓ Tous les sites ensemble : résultats complets (${all.titles.length} + ${allEh.titles.length}), sites qui n'ont pas ces tags ignorés, aucun doublon, aucune page vide en cours de route`)
+    console.log(`✓ Tous les sites ensemble : résultats complets (${all.titles.length} + ${allEh.titles.length}), sites qui n'ont jamais montré ces tags fouillés en dernier, aucun doublon, aucune page vide en cours de route`)
 
     // 7. Tags sans lien (étiquettes seules) : connus par les fiches lues, le catalogue est vérifié
     const pl = await run([t('drama'), t('school'), only('plain.test')])

@@ -69,7 +69,7 @@ async function main(): Promise<void> {
     assert.equal(r2.metadata, undefined)
     assert.equal(r1.metadata, undefined, 'la recherche Alpha, remplacée, ne continue pas')
     const fiches = requests.filter(isFiche).length
-    assert.ok(fiches <= 75, `trop de fiches lues pendant les 3 recherches : ${fiches}`)
+    assert.ok(fiches <= 95, `trop de fiches lues pendant les 3 recherches : ${fiches}`)
     console.log(`✓ 3 tags touchés coup sur coup : les 2 recherches remplacées s'arrêtent, ${fiches} fiches lues au total (plafond respecté)`)
     assert.ok(r3.results.length > 0, 'la première page de la recherche à 3 tags n\'est pas vide')
 
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
     while (meta !== undefined && calls < 60) {
         requests.length = 0
         const r = await src.getSearchResults({ includedTags: [t('alpha'), t('beta'), t('gamma')], excludedTags: [] }, meta)
-        assert.ok(requests.filter(isFiche).length <= 70, `appel ${calls} : ${requests.filter(isFiche).length} fiches lues (plafond 40, 70 avec la rallonge)`)
+        assert.ok(requests.filter(isFiche).length <= 90, `appel ${calls} : ${requests.filter(isFiche).length} fiches lues (plafond 60, 90 avec la rallonge)`)
         if (r.metadata !== undefined) assert.ok(r.results.length > 0, `appel ${calls} : page vide alors qu'il reste des pages (le défilement s'arrêterait)`)
         got3.push(...r.results.map((m: any) => m.title))
         meta = r.metadata
