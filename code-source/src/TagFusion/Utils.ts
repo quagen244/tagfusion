@@ -381,7 +381,7 @@ export function looksLikeTagUrl(url: string): boolean {
 
 // "/c12", "/ch-3", "/ep4" seulement s'ils sont suivis d'une fin de segment : "/manga/c1m1/" reste un manga
 const CHAPTER_RE = /(chapter|chapitre|chap|capitulo|episode|\/ch[-_]?\d+(?:[/.?#-]|$)|\/ep[-_]?\d+(?:[/.?#-]|$)|-ch-\d|\/c\d+(?:[/.?#]|$)|\/read\/)/i
-const MANGA_PATH_RE = /\/(manga|mangas|manhwa|manhua|comic|comics|series|serie|title|titles|webtoon|webtoons|book|books|novel|oeuvre|obra|komik)\/[^/?#]+/i
+const MANGA_PATH_RE = /\/(manga|mangas|manhwa|manhua|comic|comics|series|serie|title|titles|webtoon|webtoons|book|books|novel|oeuvre|obra|komik)\/[^/?#]+|\/(?:g|gallery|galleries|view|a|album|albums|doujin|doujins|hentai)\/\d+(?:\/[^/?#]*)?\/?(?:[?#]|$)/i
 
 export function looksLikeChapterUrl(url: string): boolean {
     return CHAPTER_RE.test(pathOf(url))

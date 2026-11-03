@@ -410,8 +410,9 @@ export async function universalChapters(f: Fetcher, mangaUrl: string, $: Cheerio
     // 4. Liste chargée depuis une adresse annexe (/ajax/…, /api/…)
     if (chapters.length < 2 && html) await step('adresse annexe', () => chaptersFromEndpoints(f, $, html, mangaUrl, base))
 
-    // 5. Page "tous les chapitres" séparée (et sa pagination)
-    if (chapters.length < 2) {
+    // 5. Page "tous les chapitres" séparée (et sa pagination) ; avec un seul chapitre trouvé,
+    //    seulement si la fiche a un vrai lien vers une liste (pas d'adresses devinées inutiles)
+    if (chapters.length === 0 || (chapters.length === 1 && hasAllChaptersLink($, mangaUrl, base))) {
         await step('page « tous les chapitres »', async () => {
             const links: string[] = []
             $('a[href]').each((_, el) => {
@@ -445,12 +446,26 @@ export async function universalChapters(f: Fetcher, mangaUrl: string, $: Cheerio
             return fromReader.length >= 2 ? [...chapters, ...fromReader] : []
         })
     }
-    // 7. Aucune liste de chapitres mais une galerie (miniatures numérotées) : un chapitre unique
+    // 7. Aucune liste de chapitres mais une galerie (miniatures numérotées) : un chapitre unique,
+    //    ou un chapitre par page de miniatures quand la galerie en a plusieurs (E-Hentai : 20 par page)
     if (chapters.length === 0) {
-        await step('galerie (chapitre unique)', () => {
+        await step('galerie', () => {
             const thumbs = galleryLinks($, mangaUrl, mangaUrl)
             const reader = readerImages($, mangaUrl)
-            return thumbs.length >= 2 || reader >= 3 ? [{ url: mangaUrl.replace(/[?#].*$/, ''), name: '', num: 1, date: parseDate('') }] : []
+            if (thumbs.length < 2 && reader < 3) return []
+            const single = [{ url: mangaUrl.replace(/[?#].*$/, ''), name: '', num: 1, date: parseDate('') }]
+            const total = totalPagesOf($, html, thumbs.length)
+            const perPage = thumbs.length
+            if (perPage < 2 || total <= perPage || !galleryHasPagination($, mangaUrl)) return single
+            const count = Math.ceil(total / perPage)
+            const urls = galleryPageUrls($, mangaUrl, count)
+            if (urls.length !== count) return single
+            return urls.map((u, i) => ({
+                url: i === 0 ? mangaUrl.replace(/#.*$/, '') : u,
+                name: `Pages ${i * perPage + 1}–${Math.min((i + 1) * perPage, total)}`,
+                num: i + 1,
+                date: parseDate('')
+            })).reverse()
         })
     }
     return sortNewestFirst(dedupe(chapters))
@@ -464,31 +479,69 @@ export async function universalChapters(f: Fetcher, mangaUrl: string, $: Cheerio
 export function galleryLinks($: CheerioAPI, pageUrl: string, galleryUrl: string): { n: number, url: string, thumb: string }[] {
     const gp = pathOf(galleryUrl).replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase()
     if (gp.length < 2) return []
-    const ids = gp.match(/\d{3,}/g) ?? []
-    const gid = ids[ids.length - 1]
+    // Tous les nombres d'au moins 3 chiffres de l'adresse : l'un d'eux est l'identifiant de la galerie
+    const ids = gp.split('/').filter(seg => /^\d{3,}$/.test(seg))
     const out: { n: number, url: string, thumb: string }[] = []
     const seen = new Set<number>()
     $('a[href]').each((_, el) => {
         const img = $(el).find('img').first()
         const text = clean($(el).text())
-        // Une miniature (image) ou un simple numéro de page ; pas un lien avec un vrai texte
+        // Une miniature (image ou case vide) ou un simple numéro de page ; pas un lien avec un vrai texte
         if (img.length === 0 && text !== '' && !/^\d+$/.test(text)) return
         const url = absoluteUrl($(el).attr('href'), pageUrl)
         if (!url || hostOf(url) !== hostOf(galleryUrl)) return
         const path = pathOf(url).replace(/[?#].*$/, '').toLowerCase()
         if (path.replace(/\/$/, '') === gp) return
+        let n: number | undefined
+        // « /g/123/4/ » ou « /gallery/123/4/ » : numéro de page en dernier, sous la galerie ou avec son identifiant
         const m = /^(.*)\/(\d+)\/?$/.exec(path)
-        if (!m) return
-        const parent = m[1] as string
-        const sameGallery = parent === gp || (!!gid && parent.split('/').includes(gid))
-        if (!sameGallery) return
-        const n = Number(m[2])
-        if (seen.has(n)) return
+        if (m && (m[1] === gp || ids.some(id => (m[1] as string).split('/').includes(id)))) n = Number(m[2])
+        // « /s/{code}/{id}-{n} » (E-Hentai) : identifiant de la galerie et numéro de page dans le dernier segment
+        if (n === undefined) {
+            const d = /\/(\d{3,})-(\d+)\/?$/.exec(path)
+            if (d && ids.includes(d[1] as string)) n = Number(d[2])
+        }
+        if (n === undefined || seen.has(n)) return
         seen.add(n)
         const node = img.get(0) as Element | undefined
         out.push({ n, url: url.replace(/#.*$/, ''), thumb: node ? absoluteUrl(pickImageSrc(node.attribs), pageUrl) ?? '' : '' })
     })
     return out.sort((a, b) => a.n - b.n)
+}
+
+/**
+ * Galerie dont les miniatures sont réparties sur plusieurs pages (E-Hentai : 20 par page, « ?p=N ») :
+ * adresses de toutes ces pages, déduites des liens de pagination de la galerie (modèle vérifié).
+ * Retourne seulement la page de départ si on ne peut pas les déduire avec certitude.
+ */
+export function galleryPageUrls($: CheerioAPI, galleryUrl: string, count: number): string[] {
+    const gp = pathOf(galleryUrl).replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase()
+    const byNumber = new Map<number, string>()
+    $('a[href]').each((_, el) => {
+        const text = clean($(el).text())
+        if (!/^\d+$/.test(text)) return
+        const url = absoluteUrl($(el).attr('href'), galleryUrl)
+        if (!url || hostOf(url) !== hostOf(galleryUrl)) return
+        if (pathOf(url).replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase() !== gp) return
+        const k = Number(text)
+        if (k >= 2 && !byNumber.has(k)) byNumber.set(k, url.replace(/#.*$/, ''))
+    })
+    const urls = [galleryUrl.replace(/#.*$/, '')]
+    if (count <= 1) return urls
+    const two = byNumber.get(2)
+    const three = byNumber.get(3)
+    let tpl: ((n: number) => string) | null = null
+    if (two && three) {
+        const t = numberTemplate(two, 2, three, 3)
+        // Vérifié sur tous les autres numéros affichés
+        if (t && [...byNumber.entries()].every(([k, u]) => t(k) === u)) tpl = t
+    }
+    for (let k = 2; k <= count; k++) {
+        const u = tpl ? tpl(k) : byNumber.get(k)
+        if (!u) return urls.length === count ? urls : [urls[0] as string]
+        urls.push(u)
+    }
+    return urls
 }
 
 /**
@@ -520,6 +573,30 @@ function readerImages($: CheerioAPI, url: string): number {
         if (src && !NOT_PAGE.test(src)) n++
     })
     return n
+}
+
+/** La fiche a-t-elle un lien explicite vers une liste de chapitres ? */
+function hasAllChaptersLink($: CheerioAPI, mangaUrl: string, base: string): boolean {
+    let found = false
+    $('a[href]').each((_, el) => {
+        if (found) return
+        const href = absoluteUrl($(el).attr('href'), mangaUrl)
+        if (!href || !sameSite(href, base)) return
+        if (ALL_CHAPTERS_RE.test(clean($(el).text()) + ' ' + clean($(el).attr('title')))) found = true
+    })
+    return found
+}
+
+/** La galerie a-t-elle des liens vers ses autres pages de miniatures (2, 3…) ? */
+function galleryHasPagination($: CheerioAPI, galleryUrl: string): boolean {
+    const gp = pathOf(galleryUrl).replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase()
+    let found = false
+    $('a[href]').each((_, el) => {
+        if (found || clean($(el).text()) !== '2') return
+        const u = absoluteUrl($(el).attr('href'), galleryUrl)
+        if (u && pathOf(u).replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase() === gp && /[?&]\w+=\d+/.test(u)) found = true
+    })
+    return found
 }
 
 /** Lien "Lire" / "Commencer" / "Premier chapitre" */
@@ -711,7 +788,7 @@ export async function galleryPages(f: Fetcher, $: CheerioAPI, url: string, html 
     if (thumbs.length < 2) return []
     const fullOf = async (pageUrl: string): Promise<string | undefined> => {
         const h = await f.get(pageUrl)
-        return universalPages(f.load(h), h, pageUrl)[0]
+        return mainImageOf(f.load(h), h, pageUrl)
     }
     // Pages annoncées mais dont la miniature n'est pas affichée ("46 pages • 24 showing")
     const total = totalPagesOf($, html, thumbs.length)
@@ -765,9 +842,24 @@ export async function galleryPages(f: Fetcher, $: CheerioAPI, url: string, html 
             opened++
             try { const full = await fullOf(slot.url); if (full) return full } catch { /* nouvel essai */ }
         }
-        return slot.thumb || undefined
+        // Page illisible : sa miniature, sinon sa page de lecture (affichée en erreur, mais rien n'est décalé)
+        return slot.thumb || slot.url
     })
     return pages.filter((x): x is string => !!x)
+}
+
+/** Sélecteurs de l'image principale d'une page de lecture, du plus sûr au moins sûr */
+const MAIN_IMAGE_SELECTORS = ['img#img', '#i3 img', '#image-container img', 'img#image', '#image img', 'img#main-image', 'img.main-image', '#reader img', '.reader-image img', '#viewer img']
+
+/** Image principale d'une page de lecture « une image par page » */
+export function mainImageOf($: CheerioAPI, html: string, url: string): string | undefined {
+    for (const sel of MAIN_IMAGE_SELECTORS) {
+        const el = $(sel).first().get(0) as Element | undefined
+        if (!el) continue
+        const src = absoluteUrl(pickImageSrc(el.attribs), url)
+        if (src && !NOT_PAGE.test(src)) return src
+    }
+    return universalPages($, html, url)[0]
 }
 
 /**
@@ -828,6 +920,71 @@ export function pagesFromGalleryData(html: string, firstFull: string | undefined
     // Vérification : la 1re page construite doit être exactement la vraie
     if (pages[0] !== firstFull.replace(/[?#].*$/, '') || firstFileNumber < 0 || firstNumber < 0) return null
     return pages
+}
+
+/**
+ * Lecteur dont la liste des pages est chiffrée dans la page (« initReader("…") », type HentaiNexus).
+ * Déchiffrement : base64, XOR des premiers octets avec le nom du site, puis flot de type RC4 dont
+ * la clé (64 octets) est en tête des données. Retenu seulement si le résultat est une liste d'images.
+ */
+export function pagesFromEncryptedReader(html: string, hostname: string): string[] | null {
+    const m = /initReader\(\s*["']((?:[A-Za-z0-9+/=\s]|\\\/){80,})["']/.exec(html)
+    if (!m) return null
+    const raw = b64decode((m[1] as string).replace(/\\\//g, '/').replace(/\s+/g, ''))
+    if (!raw || raw.length <= 64) return null
+    const data: number[] = []
+    for (let i = 0; i < raw.length; i++) data.push(raw.charCodeAt(i) & 0xff)
+    // La clé dépend du nom du site : on essaie le nom exact, puis sans « www. »
+    let parsed: unknown
+    for (const h of [...new Set([hostname.replace(/^www\./, ''), hostname])]) {
+        try { parsed = JSON.parse(decryptReader(data, h)); break } catch { parsed = undefined }
+    }
+    if (!Array.isArray(parsed)) return null
+    const pages: string[] = []
+    for (const item of parsed) {
+        if (!item || typeof item !== 'object') continue
+        const o = item as Record<string, unknown>
+        if (o['type'] !== undefined && o['type'] !== 'image') continue
+        // WebP d'abord (affiché partout), puis l'original, puis les autres champs connus
+        const u = [o['image_fallback'], o['image'], o['url'], o['src'], o['image_source']].find((v): v is string => typeof v === 'string' && /^https?:\/\//i.test(v))
+        if (u) pages.push(u)
+    }
+    return pages.length ? pages : null
+}
+
+function decryptReader(input: number[], hostname: string): string {
+    const data = input.slice()
+    for (let i = 0; i < hostname.length && i < data.length; i++) data[i] = ((data[i] as number) ^ hostname.charCodeAt(i)) & 0xff
+    const keyStream = data.slice(0, 64)
+    const cipher = data.slice(64)
+    const digest: number[] = Array.from({ length: 256 }, (_, i) => i)
+    let primeIdx = 0
+    for (let i = 0; i < 64; i++) {
+        primeIdx ^= keyStream[i] as number
+        for (let j = 0; j < 8; j++) primeIdx = (primeIdx & 1) !== 0 ? (primeIdx >>> 1) ^ 12 : primeIdx >>> 1
+    }
+    primeIdx &= 7
+    let key = 0
+    for (let i = 0; i < 256; i++) {
+        key = (key + (digest[i] as number) + (keyStream[i % 64] as number)) % 256
+        const t = digest[i] as number
+        digest[i] = digest[key] as number
+        digest[key] = t
+    }
+    const q = [2, 3, 5, 7, 11, 13, 17, 19][primeIdx] as number
+    let k = 0, n = 0, p = 0, xorKey = 0
+    let out = ''
+    for (let i = 0; i < cipher.length; i++) {
+        k = (k + q) % 256
+        n = (p + (digest[(n + (digest[k] as number)) % 256] as number)) % 256
+        p = (p + k + (digest[k] as number)) % 256
+        const t = digest[k] as number
+        digest[k] = digest[n] as number
+        digest[n] = t
+        xorKey = digest[(n + (digest[(k + (digest[(xorKey + p) % 256] as number)) % 256] as number)) % 256] as number
+        out += String.fromCharCode(((cipher[i] as number) ^ xorKey) & 0xff)
+    }
+    return out
 }
 
 /** Règles miniature -> grande image, combinables ; retenue seulement si elle reproduit tous les exemples */
@@ -891,7 +1048,7 @@ export async function universalPagesDeep(f: Fetcher, $: CheerioAPI, html: string
             for (let attempt = 0; attempt < 2; attempt++) {
                 try {
                     const h = await f.get(u)
-                    const img = universalPages(f.load(h), h, u)[0]
+                    const img = mainImageOf(f.load(h), h, u)
                     if (img) return img
                 } catch { /* nouvel essai */ }
             }

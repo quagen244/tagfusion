@@ -9,6 +9,7 @@ import {
     PagedResults,
     PartialSourceManga,
     Request,
+    RequestManager,
     Response,
     SearchRequest,
     Source,
@@ -20,17 +21,17 @@ import {
     TagSection
 } from '@paperback/types'
 import { CheerioAPI } from 'cheerio'
-import { galleryPages, orderPages, parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
+import { galleryPages, orderPages, pagesFromEncryptedReader, parseChapterInfo, universalChapters, universalPagesDeep } from './Chapters'
 import { Details, detectEngine, Engine, engineByName, Fetcher, findNextPageUrl, ListingItem, pageCandidates } from './Engines'
 import { buildSettings } from './Settings'
 import { IndexedManga, SiteInfo, SiteTag, Store, UnifiedTag } from './Store'
 import {
-    cleanTagLabel, decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
+    absoluteUrl, cleanTagLabel, decodeChapterId, decodeMangaId, encodeChapterId, encodeMangaId, hostOf, interleave, keyOfTagId,
     mapLimit, safeDate, safeEncode, safeDecode, safeNumber, safeUrl, siteIdOf, siteOfTagId, siteTagIdOf, sitesFromVersioning, tagIdOf, tagKey, titleKey
 } from './Utils'
 
 export const TagFusionInfo: SourceInfo = {
-    version: '1.9.3',
+    version: '1.10.0',
     name: 'TagFusion',
     icon: 'icon.png',
     author: 'Toi',
@@ -62,6 +63,9 @@ interface SearchMeta {
 }
 
 const DISCOVERY_BUDGET_MS = 10000
+/** Sites à 1 requête/s et à 2 requêtes/s (leurs limites connues) */
+const SLOW_SITES = new Set(['hentainexus.com'])
+const POLITE_SITES = new Set(['e-hentai.org', 'exhentai.org'])
 /** Nombre maximum de tags affichés sur l'écran de recherche */
 const MAX_SEARCH_TAGS = 500
 /** Recherche : fiches lues au plus par appel, et temps maximum par appel (premier / suivants) */
@@ -137,6 +141,31 @@ export class TagFusion extends Source {
     })
 
     /**
+     * Sites qui limitent le nombre de requêtes : chacun passe par un gestionnaire plus lent.
+     * 1 requête/s : HentaiNexus (sa limite), et tout site qui a répondu « trop de requêtes » (429).
+     * 2 requêtes/s : E-Hentai / ExHentai (bannissement temporaire en cas d'excès).
+     */
+    private slowManager = App.createRequestManager({
+        requestsPerSecond: 1,
+        requestTimeout: 25000,
+        interceptor: new SiteInterceptor(url => this.refererFor(url), () => this.userAgent())
+    })
+    private politeManager = App.createRequestManager({
+        requestsPerSecond: 2,
+        requestTimeout: 25000,
+        interceptor: new SiteInterceptor(url => this.refererFor(url), () => this.userAgent())
+    })
+    private throttledHosts = new Set<string>()
+
+    private managerFor(url: string): RequestManager {
+        const host = hostOf(url)
+        const root = host.split('.').slice(-2).join('.')
+        if (SLOW_SITES.has(root) || this.throttledHosts.has(host)) return this.slowManager
+        if (POLITE_SITES.has(root)) return this.politeManager
+        return this.requestManager
+    }
+
+    /**
      * Site d'origine à annoncer pour une requête (en-tête Referer). Beaucoup de serveurs d'images
      * refusent une image sans lui. Ordre : mémoire de cet exemplaire, mémoire enregistrée (partagée
      * avec les autres exemplaires et les sessions suivantes), site de même domaine, sinon l'adresse elle-même.
@@ -185,7 +214,9 @@ export class TagFusion extends Source {
         let lastError: unknown
         for (let attempt = 0; attempt < 3; attempt++) {
             try {
-                const r = await this.requestManager.schedule(App.createRequest({ url, method, headers, ...(data !== undefined ? { data } : {}) }), 1)
+                const r = await this.managerFor(url).schedule(App.createRequest({ url, method, headers, ...(data !== undefined ? { data } : {}) }), 1)
+                // « Trop de requêtes » : ce site passe au rythme lent, pour cette requête et les suivantes
+                if (r.status === 429 && !this.throttledHosts.has(host)) this.throttledHosts.add(host)
                 const transient = r.status === 0 || r.status === 408 || r.status === 425 || r.status === 429 || r.status === 500 || r.status === 502 || r.status === 504
                     || (r.status === 503 && !/cf-chl|challenge-platform|just a moment|cf_clearance/i.test(r.data ?? ''))
                 response = r
@@ -207,6 +238,22 @@ export class TagFusion extends Source {
         if (response.status >= 400) throw new Error(`${host} a répondu ${response.status}`)
         // Le site répond normalement : s'il était bloqué par Cloudflare, il ne l'est plus
         await this.store.markCloudflareOk(host)
+        // Page d'avertissement de contenu (« Content Warning ») : on suit le lien qui affiche la galerie
+        if (method === 'GET' && /content\s+warning/i.test(html) && /[?&]nw=(?:always|session)/.test(html) && !/[?&]nw=/.test(url)) {
+            const $w = this.cheerio.load(html) as CheerioAPI
+            let pass: string | undefined
+            $w('a[href]').each((_, el) => {
+                const href = $w(el).attr('href') ?? ''
+                if (!pass && /[?&]nw=always/.test(href)) pass = href
+            })
+            if (!pass) $w('a[href]').each((_, el) => { const href = $w(el).attr('href') ?? ''; if (!pass && /[?&]nw=session/.test(href)) pass = href })
+            const target = pass ? absoluteUrl(pass, url) : null
+            if (target && hostOf(target) === host) {
+                const passed = await this.http('GET', target, undefined, headers)
+                this.htmlCache.set(url, { html: passed, at: Date.now() })
+                return passed
+            }
+        }
         if (method === 'GET' && html.length < 1500000) {
             this.htmlCache.set(url, { html, at: Date.now() })
             if (this.htmlCache.size > 15) {
@@ -1096,7 +1143,7 @@ export class TagFusion extends Source {
     override async getChapterDetails(mangaId: string, chapterId: string): Promise<ChapterDetails> {
         const { siteId } = decodeMangaId(mangaId)
         const base = await this.baseOf(siteId)
-        const cacheKey = `v2|${siteId}|${chapterId}`
+        const cacheKey = `v3|${siteId}|${chapterId}`
         // Paperback redemande souvent le même chapitre (préchargement, retour en arrière) :
         // on renvoie exactement la même liste pendant 30 minutes, pour un ordre et un nombre de pages stables
         const cached = await this.store.getCachedPages(cacheKey).catch(() => undefined)
@@ -1112,8 +1159,10 @@ export class TagFusion extends Source {
             const pageUrl = engine.chapterPageUrl(base + decodeChapterId(chapterId))
             const html = await this.fetcher.get(pageUrl)
             const $p = this.fetcher.load(html)
+            // Lecteur chiffré (type HentaiNexus) : la liste exacte des pages, déchiffrée
+            let found = pagesFromEncryptedReader(html, hostOf(pageUrl)) ?? []
             // Galerie (miniatures vers des pages de lecture) : images en taille réelle, jamais les miniatures
-            let found = await galleryPages(this.fetcher, $p, pageUrl, html)
+            if (found.length < 1) found = await galleryPages(this.fetcher, $p, pageUrl, html)
             if (found.length < 2) found = engine.parsePages($p, html, pageUrl)
             // Vieux lecteurs "une image par page" : on suit les pages du chapitre
             if (found.length < 2) found = await universalPagesDeep(this.fetcher, $p, html, pageUrl)

@@ -57,9 +57,10 @@ export interface Engine {
 // --- Outils communs ------------------------------------------------------------
 
 /** Liens qui ne sont pas des genres : artistes, groupes, personnages, parodies, langues… */
-const NON_GENRE_PATH = /\/(artists?|authors?|auteurs?|groups?|circles?|parod(?:y|ies)|characters?|personnages?|languages?|langues?|uploaders?|users?|members?|scanlators?|translators?|traducteurs?|teams?|magazines?|publishers?|studios?)\//i
-const NON_GENRE_QUERY = /[?&](?:q|s|query|search|tag)=(?:artist|author|group|circle|parody|character|language|uploader)(?::|%3a)/i
-const NON_GENRE_LABEL = /^(artist|author|group|circle|parody|character|language|uploader)s?\s*:/i
+const NON_GENRE_WORDS = 'artist|author|group|circle|parody|character|language|uploader|magazine|publisher|event|cosplayer|reclass|temp'
+const NON_GENRE_PATH = new RegExp(`\\/(artists?|authors?|auteurs?|groups?|circles?|parod(?:y|ies)|characters?|personnages?|languages?|langues?|uploaders?|users?|members?|scanlators?|translators?|traducteurs?|teams?|magazines?|publishers?|studios?|events?)\\/|\\/tags?\\/(?:${NON_GENRE_WORDS})(?::|%3a)`, 'i')
+const NON_GENRE_QUERY = new RegExp(`[?&](?:q|s|query|search|tag|f_search)=(?:%22|")?(?:${NON_GENRE_WORDS})(?::|%3a)`, 'i')
+const NON_GENRE_LABEL = new RegExp(`^(?:${NON_GENRE_WORDS})s?\\s*:`, 'i')
 
 const NAV_SCOPE = 'header, nav, footer, aside, .menu, .navbar, .nav-menu, .main-menu, .sub-menu, .dropdown-menu, .sidebar, .widget, #menu, .footer, .header'
 
@@ -67,12 +68,16 @@ function clean(s: string | undefined): string {
     return (s ?? '').replace(/\s+/g, ' ').trim()
 }
 
+const ICON_IMG = /(?:^|\/)[a-z]{1,3}\.(?:png|gif)(?:[?#]|$)|icon|sprite|blank|loading|spinner|placeholder|flag/i
+
 function imgOf<T>(el: Cheerio<T>, base: string): string {
-    const img = el.is('img') ? el : el.find('img').first()
-    if (img.length === 0) return ''
-    const node = img.get(0) as Element | undefined
-    const src = pickImageSrc(node?.attribs ?? {})
-    return absoluteUrl(src, base) ?? ''
+    const imgs = el.is('img') ? [el.get(0) as Element | undefined] : (el.find('img').get() as Element[])
+    // La première vraie image (pas une icône du site ni une image de chargement)
+    for (const node of imgs) {
+        const src = absoluteUrl(pickImageSrc(node?.attribs ?? {}), base)
+        if (src && !ICON_IMG.test(src.replace(/^https?:\/\/[^/]+/, ''))) return src
+    }
+    return ''
 }
 
 function sameHost(url: string, base: string): boolean {
@@ -194,11 +199,12 @@ function genericListing($: CheerioAPI, pageUrl: string, base: string): ListingIt
         if (looksLikeTagUrl(clean_url) || looksLikeChapterUrl(clean_url)) return
         if (strict && !looksLikeMangaUrl(clean_url)) return
         if (!strict && (/\/page\/\d+|[?&]page=|\/(login|register|user|account|profile|bookmark|contact|privacy|dmca|terms)/i.test(clean_url) || clean_url.replace(/\/$/, '') === base)) return
-        const card = a.closest('li, article, .item, .card, .bs, .bsx, [class*="item"], [class*="card"], div')
+        const card = a.closest('li, tr, article, .item, .card, .bs, .bsx, [class*="item"], [class*="card"], div')
         let image = imgOf(a, pageUrl)
         if (!image && card.length) image = imgOf(card, pageUrl)
-        const heading = card.find('h1, h2, h3, h4, h5, .title, [class*="title"]').first()
-        const title = clean(a.attr('title')) || clean(a.find('img').attr('alt')) || clean(heading.text()) || clean(a.text())
+        const heading = card.find('h1, h2, h3, h4, h5, .title, [class*="title"], .glink, [class*="caption"]').first()
+        const inner = a.find('.glink, [class*="title"], [class*="caption"]').first()
+        const title = clean(a.attr('title')) || clean(inner.text()) || clean(a.find('img').attr('alt')) || clean(heading.text()) || clean(a.text())
         if (!title || title.length > 200) return
         const prev = byUrl.get(clean_url)
         if (!prev) byUrl.set(clean_url, { url: clean_url, title, image })
@@ -209,9 +215,12 @@ function genericListing($: CheerioAPI, pageUrl: string, base: string): ListingIt
     }
     $('a[href]').each((_, el) => consider(el, true))
     // Si le site n'utilise pas d'URL "/manga/..." : on prend les liens avec une image
+    // (on garde la liste stricte si l'autre n'en trouve pas davantage : une page courte reste une vraie liste)
     if (byUrl.size < 3) {
+        const strict = new Map(byUrl)
         byUrl.clear()
         $('a[href]').each((_, el) => { if ($(el).find('img').length) consider(el, false) })
+        if (byUrl.size <= strict.size) { byUrl.clear(); for (const [k, v] of strict) byUrl.set(k, v) }
     }
     // Une vraie liste de mangas a des images : on garde seulement les entrées illustrées si possible
     const all = [...byUrl.values()]
@@ -504,6 +513,18 @@ export function findNextPageUrl($: CheerioAPI, pageUrl: string, page: number): s
         const u = usable($(sel).first().attr('href'))
         if (u) return u
     }
+    // Adresse de la page suivante écrite dans un script (var nexturl = "…" ; vide = dernière page)
+    let fromScript: string | undefined
+    let scriptSaysLast = false
+    $('script').each((_, el) => {
+        if (fromScript || scriptSaysLast) return
+        const m = /\bvar\s+next_?url\s*=\s*["']([^"']*)["']/i.exec($(el).text())
+        if (!m) return
+        if (m[1] === '') scriptSaysLast = true
+        else fromScript = usable((m[1] as string).replace(/\\\//g, '/'))
+    })
+    if (fromScript) return fromScript
+    if (scriptSaysLast) return undefined
     const nextNum = String(page + 1)
     let found: string | undefined
     // Lien "N+1" dans une zone de pagination
